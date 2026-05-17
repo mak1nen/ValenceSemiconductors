@@ -1,0 +1,81 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+
+ARG SBT_VERSION=1.10.6
+ARG FIRTOOL_VERSION=1.135.0
+ARG VERILATOR_VERSION=5.026
+
+# System packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl wget git gnupg2 ca-certificates unzip \
+    build-essential cmake autoconf flex bison \
+    libfl2 libfl-dev zlib1g zlib1g-dev \
+    libgoogle-perftools-dev numactl perl \
+    python3 python3-pip \
+    yosys gtkwave \
+    vim nano htop bash-completion sudo \
+  && rm -rf /var/lib/apt/lists/*
+
+# JDK 17 (Temurin)
+RUN wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public \
+      | gpg --dearmor | tee /etc/apt/trusted.gpg.d/adoptium.gpg > /dev/null \
+  && echo "deb https://packages.adoptium.net/artifactory/deb noble main" \
+      > /etc/apt/sources.list.d/adoptium.list \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends temurin-17-jdk \
+  && rm -rf /var/lib/apt/lists/*
+
+ENV JAVA_HOME=/usr/lib/jvm/temurin-17-amd64
+ENV PATH="${JAVA_HOME}/bin:${PATH}"
+
+# SBT
+RUN curl -fsSL \
+    "https://github.com/sbt/sbt/releases/download/v${SBT_VERSION}/sbt-${SBT_VERSION}.tgz" \
+    | tar -xz -C /usr/local \
+  && ln -s /usr/local/sbt/bin/sbt /usr/local/bin/sbt
+
+# firtool (pinned — Chisel 7.2.0 / firtool 1.135.0)
+RUN wget -q -O /tmp/circt.tar.gz \
+    "https://github.com/llvm/circt/releases/download/firtool-${FIRTOOL_VERSION}/circt-full-shared-linux-x64.tar.gz" \
+  && tar -xz -C /tmp -f /tmp/circt.tar.gz \
+  && install -m 755 /tmp/firtool-${FIRTOOL_VERSION}/bin/firtool /usr/local/bin/firtool \
+  && rm -rf /tmp/circt.tar.gz /tmp/firtool-${FIRTOOL_VERSION}
+
+ENV CHISEL_FIRTOOL_PATH=/usr/local/bin
+
+# Verilator (built from source)
+RUN git clone --depth 1 --branch v${VERILATOR_VERSION} \
+      https://github.com/verilator/verilator.git /tmp/verilator \
+  && cd /tmp/verilator \
+  && autoconf && ./configure --prefix=/usr/local \
+  && make -j$(nproc) && make install \
+  && rm -rf /tmp/verilator
+
+# Python deps
+RUN pip3 install --no-cache-dir --break-system-packages \
+    PyYAML mako pytest pyelftools
+
+# Dev user
+RUN useradd -m -u 1000 -s /bin/bash dev \
+  && echo "dev ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+USER dev
+WORKDIR /home/dev
+
+# Clone test branch
+RUN git clone \
+    --branch test \
+    --depth 1 \
+    https://github.com/otto123om/ValenceSemiconductors.git \
+    /home/dev/valence-riscv
+
+WORKDIR /home/dev/valence-riscv
+
+# Warm SBT / Coursier dep cache
+RUN sbt -J-Xmx4G "hardware/compile" || true
+
+ENV SBT_OPTS="-Xmx6G -Xss8M -XX:+UseG1GC"
+
+CMD ["/bin/bash"]

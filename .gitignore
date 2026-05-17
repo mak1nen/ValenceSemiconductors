@@ -1,0 +1,20 @@
+# SBT build artifacts
+target/
+**/target/
+project/project/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Scala
+*.class
+*.log
+
+# Generated Verilog
+hardware/generated/
+
+# IDE
+.idea/
+.metals/
+.bsp/
