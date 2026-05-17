@@ -1,6 +1,5 @@
-val chiselVersion     = "7.2.0"
-val chiselTestVersion = "6.0.0"
-val scalaTestVersion  = "3.2.19"
+val chiselVersion    = "7.2.0"
+val scalaTestVersion = "3.2.19"
 
 ThisBuild / organization := "com.valence"
 ThisBuild / version      := "0.1.0-SNAPSHOT"
@@ -35,9 +34,8 @@ lazy val hardware = (project in file("hardware"))
     Compile / resourceDirectory := baseDirectory.value / "src" / "main" / "resources",
 
     libraryDependencies ++= Seq(
-      "org.chipsalliance" %% "chisel"     % chiselVersion,
-      "edu.berkeley.cs"   %% "chiseltest" % chiselTestVersion % Test,
-      "org.scalatest"     %% "scalatest"  % scalaTestVersion  % Test,
+      "org.chipsalliance" %% "chisel"    % chiselVersion,
+      "org.scalatest"     %% "scalatest" % scalaTestVersion % Test,
     ),
 
     Test / testOptions       += Tests.Argument(TestFrameworks.ScalaTest, "-oDF"),
