@@ -1,0 +1,66 @@
+# =============================================================================
+# Valence SIM — fast simulation config
+# Node: sky130 (real open PDK values)
+# Purpose: fast elaboration + chiseltest + Verilator bringup
+# No FPU, no NPU, no MMU — minimal feature set for speed
+# =============================================================================
+
+chip:
+  name: "ValenceSim"
+  version: "0.1.0"
+  description: "Minimal simulation config — fast elaboration and testing"
+
+physical:
+  node: "sky130"
+  clock_period_ns: 10.0
+  setup_margin_ns: 0.10
+  hold_margin_ns:  0.05
+  voltage_v:       1.8
+  metal_layers:    5
+  max_fanout:      16
+
+isa:
+  xlen: 64
+  extensions:
+    fpu:        false
+    compressed: false
+    atomic:     false
+    vector:     false
+
+privilege:
+  supervisor: false
+  mmu:        false
+  pmp:        false
+
+pipeline:
+  stages:       5
+  reset_vector: "0x80000000"
+
+icache:
+  sets:        32
+  ways:        2
+  block_bytes: 64
+  mshrs:       2
+  tlb_entries: 16
+
+dcache:
+  sets:        32
+  ways:        2
+  block_bytes: 64
+  mshrs:       2
+  tlb_entries: 16
+
+gemm:
+  enabled:       false
+  tile_size:     4
+  data_width:    16
+  mac_units:     16
+  scratchpad_kb: 64
+
+soc:
+  n_harts:      1
+  mem_base:     "0x80000000"
+  mem_size_mb:  256
+  uart_base:    "0x10000000"
+  clint_base:   "0x02000000"
+  plic_base:    "0x0C000000"

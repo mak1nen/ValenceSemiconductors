@@ -1,0 +1,66 @@
+# =============================================================================
+# Valence sky130 — full featured config
+# Node: sky130 (real open PDK values)
+# Purpose: full Linux-capable core + GEMM unit, sky130 verification
+# This is the config to verify against before any real node tapeout
+# =============================================================================
+
+chip:
+  name: "ValenceSky130"
+  version: "0.1.0"
+  description: "Full featured Linux + GEMM config on sky130 — verification target"
+
+physical:
+  node: "sky130"
+  clock_period_ns: 10.0
+  setup_margin_ns: 0.10
+  hold_margin_ns:  0.05
+  voltage_v:       1.8
+  metal_layers:    5
+  max_fanout:      16
+
+isa:
+  xlen: 64
+  extensions:
+    fpu:        true
+    compressed: true
+    atomic:     true
+    vector:     false
+
+privilege:
+  supervisor: true
+  mmu:        true
+  pmp:        true
+
+pipeline:
+  stages:       5
+  reset_vector: "0x80000000"
+
+icache:
+  sets:        64
+  ways:        4
+  block_bytes: 64
+  mshrs:       4
+  tlb_entries: 32
+
+dcache:
+  sets:        64
+  ways:        4
+  block_bytes: 64
+  mshrs:       4
+  tlb_entries: 32
+
+gemm:
+  enabled:       true
+  tile_size:     4
+  data_width:    16
+  mac_units:     16
+  scratchpad_kb: 64
+
+soc:
+  n_harts:      1
+  mem_base:     "0x80000000"
+  mem_size_mb:  512
+  uart_base:    "0x10000000"
+  clint_base:   "0x02000000"
+  plic_base:    "0x0C000000"

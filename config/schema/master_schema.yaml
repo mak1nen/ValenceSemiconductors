@@ -1,0 +1,263 @@
+# =============================================================================
+# Valence — Master chip config schema
+# Every chip YAML must conform to this schema.
+# Add a new node ONLY when you have real PDK data for it.
+# =============================================================================
+
+chip:
+  name:
+    type: string
+    required: true
+  version:
+    type: string
+    pattern: "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    required: true
+  description:
+    type: string
+    required: true
+
+# ---------------------------------------------------------------------------
+# Physical — values must come from real PDK documentation
+# Do not guess these numbers
+# ---------------------------------------------------------------------------
+physical:
+  node:
+    type: string
+    required: true
+    allowed:
+      - sky130      # open PDK — real values known
+      - gf12lp      # add when Europractice docs available
+      - tsmc_n7     # add when TSMC NDA signed
+      - tsmc_n5     # roadmap
+      - tsmc_n3     # roadmap
+      - tsmc_n2     # roadmap
+
+  clock_period_ns:
+    type: float
+    required: true
+    min: 0.1
+    max: 100.0
+    notes:
+      sky130:  10.0   # ~100MHz realistic
+      gf12lp:  2.0    # ~500MHz
+      tsmc_n7: 1.0    # ~1GHz
+      tsmc_n3: 0.5    # ~2GHz
+      tsmc_n2: 0.4    # ~2.5GHz
+
+  setup_margin_ns:
+    type: float
+    required: true
+    min: 0.001
+    max: 10.0
+
+  hold_margin_ns:
+    type: float
+    required: true
+    min: 0.001
+    max: 10.0
+
+  voltage_v:
+    type: float
+    required: true
+    min: 0.5
+    max: 3.3
+    notes:
+      sky130:  1.8
+      gf12lp:  0.8
+      tsmc_n7: 0.75
+      tsmc_n3: 0.65
+      tsmc_n2: 0.60
+
+  metal_layers:
+    type: int
+    required: true
+    min: 4
+    max: 25
+    notes:
+      sky130:  5
+      gf12lp:  12
+      tsmc_n7: 15
+      tsmc_n3: 18
+      tsmc_n2: 20
+
+  max_fanout:
+    type: int
+    required: true
+    min: 4
+    max: 64
+
+# ---------------------------------------------------------------------------
+# ISA
+# ---------------------------------------------------------------------------
+isa:
+  xlen:
+    type: int
+    required: true
+    allowed: [32, 64]
+
+  extensions:
+    fpu:
+      type: bool
+      required: true
+      description: "F + D extensions — required for Linux"
+    compressed:
+      type: bool
+      required: true
+      description: "C extension — smaller code size"
+    atomic:
+      type: bool
+      required: true
+      description: "A extension — required for Linux"
+    vector:
+      type: bool
+      required: true
+      description: "V extension — roadmap"
+
+# ---------------------------------------------------------------------------
+# Privilege
+# ---------------------------------------------------------------------------
+privilege:
+  supervisor:
+    type: bool
+    required: true
+    description: "S-mode — required for Linux"
+  mmu:
+    type: bool
+    required: true
+    description: "Sv39 virtual memory — requires supervisor"
+    constraint: "mmu=true requires supervisor=true"
+  pmp:
+    type: bool
+    required: true
+    description: "Physical memory protection"
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
+pipeline:
+  stages:
+    type: int
+    required: true
+    min: 3
+    max: 20
+  reset_vector:
+    type: string
+    required: true
+    pattern: "^0x[0-9a-fA-F]+$"
+
+# ---------------------------------------------------------------------------
+# Caches
+# ---------------------------------------------------------------------------
+icache:
+  sets:
+    type: int
+    required: true
+    min: 16
+    max: 1024
+    constraint: "must be power of 2"
+  ways:
+    type: int
+    required: true
+    allowed: [1, 2, 4, 8, 16]
+  block_bytes:
+    type: int
+    required: true
+    allowed: [32, 64, 128]
+  mshrs:
+    type: int
+    required: true
+    min: 1
+    max: 32
+  tlb_entries:
+    type: int
+    required: true
+    min: 8
+    max: 256
+    constraint: "must be power of 2"
+
+dcache:
+  sets:
+    type: int
+    required: true
+    min: 16
+    max: 1024
+    constraint: "must be power of 2"
+  ways:
+    type: int
+    required: true
+    allowed: [1, 2, 4, 8, 16]
+  block_bytes:
+    type: int
+    required: true
+    allowed: [32, 64, 128]
+  mshrs:
+    type: int
+    required: true
+    min: 1
+    max: 32
+  tlb_entries:
+    type: int
+    required: true
+    min: 8
+    max: 256
+    constraint: "must be power of 2"
+
+# ---------------------------------------------------------------------------
+# GEMM / NPU
+# ---------------------------------------------------------------------------
+gemm:
+  enabled:
+    type: bool
+    required: true
+  tile_size:
+    type: int
+    required: true
+    allowed: [4, 8, 16, 32]
+    constraint: "must be power of 2"
+  data_width:
+    type: int
+    required: true
+    allowed: [8, 16]
+    description: "INT8=8, INT16/FP16/BF16=16"
+  mac_units:
+    type: int
+    required: true
+    min: 4
+    max: 4096
+    constraint: "must be power of 2"
+  scratchpad_kb:
+    type: int
+    required: true
+    min: 16
+    max: 8192
+
+# ---------------------------------------------------------------------------
+# SoC
+# ---------------------------------------------------------------------------
+soc:
+  n_harts:
+    type: int
+    required: true
+    min: 1
+    max: 64
+  mem_base:
+    type: string
+    required: true
+    pattern: "^0x[0-9a-fA-F]+$"
+  mem_size_mb:
+    type: int
+    required: true
+    min: 64
+    max: 65536
+  uart_base:
+    type: string
+    required: true
+    pattern: "^0x[0-9a-fA-F]+$"
+  clint_base:
+    type: string
+    required: true
+    pattern: "^0x[0-9a-fA-F]+$"
+  plic_base:
+    type: string
+    required: true
+    pattern: "^0x[0-9a-fA-F]+$"
