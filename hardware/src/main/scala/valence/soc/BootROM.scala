@@ -35,7 +35,7 @@ class BootROM extends Module {
     0x0000006FL.U(32.W),
   ))
 
-  val offset = (io.addr - MemoryMap.BOOTROM_BASE.U) >> 2
+  val offset = (io.addr - MemoryMap.BOOTROM_BASE.U)(log2Ceil(rom.length) + 1, 2)
   io.data := Mux(
     io.valid && offset < rom.length.U,
     rom(offset),

@@ -56,3 +56,12 @@ Only add a node when you have real PDK data for it.
 - Never edit `GeneratedParams.scala` by hand — always overwritten
 - Never guess physical params — only use real PDK values
 - `CoreParams.scala` defines structure only — never add values there
+
+
+## TO COMPILE 
+
+python3 scripts/generate_params_master.py config/chips/sim.yaml && sbt elaborate
+
+for example sky130 
+
+python3 scripts/generate_params_master.py config/chips/sky130.yaml && sbt elaborate
