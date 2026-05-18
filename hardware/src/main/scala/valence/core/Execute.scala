@@ -12,6 +12,7 @@ class ExecuteIn extends Bundle {
   val rd      = UInt(5.W)
   val aluOp   = UInt(4.W)
   val brOp    = UInt(3.W)
+  val memOp   = UInt(3.W)
   val useImm  = Bool()
   val isLoad  = Bool()
   val isStore = Bool()
@@ -25,14 +26,15 @@ class ExecuteIn extends Bundle {
 }
 
 class ExecuteOut extends Bundle {
-  val result      = UInt(64.W)
-  val rd          = UInt(5.W)
-  val rs2_val     = UInt(64.W)
-  val isLoad      = Bool()
-  val isStore     = Bool()
-  val branch_taken= Bool()
+  val result       = UInt(64.W)
+  val rd           = UInt(5.W)
+  val rs2_val      = UInt(64.W)
+  val memOp        = UInt(3.W)
+  val isLoad       = Bool()
+  val isStore      = Bool()
+  val branch_taken = Bool()
   val branch_target= UInt(64.W)
-  val valid       = Bool()
+  val valid        = Bool()
 }
 
 class Execute extends Module {
@@ -71,6 +73,7 @@ class Execute extends Module {
                          io.in.pc + 4.U, alu.io.result)
   io.out.rd           := io.in.rd
   io.out.rs2_val      := io.in.rs2_val
+  io.out.memOp        := io.in.memOp
   io.out.isLoad       := io.in.isLoad
   io.out.isStore      := io.in.isStore
   io.out.branch_taken := (io.in.isBranch && bu.io.taken) ||

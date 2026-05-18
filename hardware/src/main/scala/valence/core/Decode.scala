@@ -27,6 +27,7 @@ class DecodeOut extends Bundle {
   val imm     = UInt(64.W)
   val aluOp   = UInt(4.W)
   val brOp    = UInt(3.W)
+  val memOp   = UInt(3.W)  // LOAD/STORE funct3: width + signedness
   val isLoad  = Bool()
   val isStore = Bool()
   val isBranch= Bool()
@@ -65,6 +66,7 @@ class Decode extends Module {
   out.rs1      := rs1
   out.rs2      := rs2
   out.rd       := rd
+  out.memOp    := funct3
   out.isLoad   := opcode === Opcode.LOAD
   out.isStore  := opcode === Opcode.STORE
   out.isBranch := opcode === Opcode.BRANCH

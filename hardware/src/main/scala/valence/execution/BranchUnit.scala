@@ -6,10 +6,10 @@ import chisel3.util._
 object BranchUnit {
   val BEQ  = 0
   val BNE  = 1
-  val BLT  = 2
-  val BGE  = 3
-  val BLTU = 4
-  val BGEU = 5
+  val BLT  = 4
+  val BGE  = 5
+  val BLTU = 6
+  val BGEU = 7
 }
 
 class BranchUnit(xlen: Int) extends Module {
