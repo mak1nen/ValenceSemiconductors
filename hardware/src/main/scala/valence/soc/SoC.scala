@@ -34,74 +34,87 @@ import chisel3.util._
 import valence.core.Core
 import valence.caches.{ICache, DCache}
 import valence.peripherals.{UART, CLINT}
-import valence.bus.AXI4Xbar
 import valence.params.CoreParams
 
 class SoC(p: CoreParams) extends Module {
   val io = IO(new Bundle {
-    val uart_tx  = Output(Bool())
-    val uart_rx  = Input(Bool())
+    val uart_tx = Output(Bool())
+    val uart_rx = Input(Bool())
   })
 
-  // core
-  val core  = Module(new Core(p))
+  // -------------------------------------------------------------------------
+  // Blocks
+  // -------------------------------------------------------------------------
+  val core = Module(new Core(p))
 
-  // caches
   val icache = Module(new ICache(
-    nSets     = p.iCache.nSets,
-    nWays     = p.iCache.nWays,
-    blockBytes= p.iCache.blockBytes
-  ))
-  val dcache = Module(new DCache(
-    nSets     = p.dCache.nSets,
-    nWays     = p.dCache.nWays,
-    blockBytes= p.dCache.blockBytes
+    nSets      = p.iCache.nSets,
+    nWays      = p.iCache.nWays,
+    blockBytes = p.iCache.blockBytes
   ))
 
-  // peripherals
+  val dcache = Module(new DCache(
+    nSets      = p.dCache.nSets,
+    nWays      = p.dCache.nWays,
+    blockBytes = p.dCache.blockBytes
+  ))
+
   val uart    = Module(new UART(50000000, 115200))
   val clint   = Module(new CLINT(p.nHarts))
   val bootrom = Module(new BootROM)
   val sram    = Module(new SRAM)
 
   // -------------------------------------------------------------------------
-  // Address decode helpers (data path)
+  // Address decode helpers — data path
   // -------------------------------------------------------------------------
-  val sram_sel = core.io.dcache_addr >= MemoryMap.SRAM_BASE.U &&
-                 core.io.dcache_addr <  (MemoryMap.SRAM_BASE + MemoryMap.SRAM_SIZE).U
+  val sram_sel =
+    core.io.dcache_addr >= MemoryMap.SRAM_BASE.U &&
+    core.io.dcache_addr <  (MemoryMap.SRAM_BASE + MemoryMap.SRAM_SIZE).U
 
-  val clint_sel = core.io.dcache_addr >= MemoryMap.CLINT_BASE.U &&
-                  core.io.dcache_addr <  (MemoryMap.CLINT_BASE + MemoryMap.CLINT_SIZE).U
+  val clint_sel =
+    core.io.dcache_addr >= MemoryMap.CLINT_BASE.U &&
+    core.io.dcache_addr <  (MemoryMap.CLINT_BASE + MemoryMap.CLINT_SIZE).U
 
-  val uart_sel = core.io.dcache_addr >= MemoryMap.UART_BASE.U &&
-                 core.io.dcache_addr <  (MemoryMap.UART_BASE + MemoryMap.UART_SIZE).U
+  val uart_sel =
+    core.io.dcache_addr >= MemoryMap.UART_BASE.U &&
+    core.io.dcache_addr <  (MemoryMap.UART_BASE + MemoryMap.UART_SIZE).U
+
+  // UART write request from CPU data path.
+  // Declare this here so both DCache stall logic and UART wiring can use it.
+  val uart_write = core.io.dcache_valid && core.io.dcache_wen && uart_sel
 
   // -------------------------------------------------------------------------
   // ICache — fetch path
-  // Bypass ICache for now: feed instructions directly from BootROM/SRAM
-  // TODO: fix ICache to be word-addressed (store multiple words per line)
+  // Bypass ICache for now: feed instructions directly from BootROM/SRAM.
+  // TODO: fix ICache to be word-addressed (store multiple words per line).
   // -------------------------------------------------------------------------
   icache.io.req.valid  := core.io.icache_req
   icache.io.req.addr   := core.io.icache_addr
-  core.io.icache_stall := false.B  // no stall — direct feed
+  core.io.icache_stall := false.B
 
-  bootrom.io.addr  := core.io.icache_addr
-  // Subtraction-based range check — prevents CIRCT from optimizing the comparison away
-  bootrom.io.valid := (core.io.icache_addr - MemoryMap.BOOTROM_BASE.U) < MemoryMap.BOOTROM_SIZE.U
+  bootrom.io.addr := core.io.icache_addr
 
-  val sram_fetch_sel = (core.io.icache_addr - MemoryMap.SRAM_BASE.U) < MemoryMap.SRAM_SIZE.U
+  // Subtraction-based range check — prevents CIRCT from optimizing the comparison away.
+  bootrom.io.valid :=
+    (core.io.icache_addr - MemoryMap.BOOTROM_BASE.U) < MemoryMap.BOOTROM_SIZE.U
+
+  val sram_fetch_sel =
+    (core.io.icache_addr - MemoryMap.SRAM_BASE.U) < MemoryMap.SRAM_SIZE.U
 
   sram.io.fetch_addr  := core.io.icache_addr
   sram.io.fetch_valid := sram_fetch_sel
 
-  // Select correct 32-bit instruction from 64-bit SRAM word (addr[2] picks half)
-  val sram_instr = Mux(core.io.icache_addr(2),
-                       sram.io.fetch_data(63, 32),
-                       sram.io.fetch_data(31, 0))
+  // Select correct 32-bit instruction from 64-bit SRAM word.
+  // addr[2] chooses low/high halfword of the 64-bit fetch word.
+  val sram_instr = Mux(
+    core.io.icache_addr(2),
+    sram.io.fetch_data(63, 32),
+    sram.io.fetch_data(31, 0)
+  )
 
   core.io.icache_data := Mux(bootrom.io.valid, bootrom.io.data, sram_instr)
 
-  // Keep ICache mem port wired even though we bypass — required for elaboration
+  // Keep ICache memory port wired even though fetch currently bypasses it.
   icache.io.mem.valid := false.B
   icache.io.mem.data  := 0.U
 
@@ -112,12 +125,17 @@ class SoC(p: CoreParams) extends Module {
   dcache.io.req.addr  := core.io.dcache_addr
   dcache.io.req.wen   := core.io.dcache_wen
   dcache.io.req.wdata := core.io.dcache_wdata
-  core.io.dcache_stall := dcache.io.resp.stall
 
   dcache.io.mem.valid := sram.io.valid && !core.io.dcache_wen
   dcache.io.mem.data  := sram.io.rdata
 
-  // Route rdata: SRAM for data region, DCache otherwise
+  // Stall CPU while writing UART if UART is busy.
+  // Without this, software writes the next byte long before the UART frame
+  // for the previous byte has finished, and bytes after the first are dropped.
+  core.io.dcache_stall := uart_write && !uart.io.tx_ready
+
+  // Route data readback.
+  // SRAM loads bypass DCache response because SRAM is directly connected here.
   core.io.dcache_rdata := Mux(sram_sel, sram.io.rdata, dcache.io.resp.rdata)
 
   // -------------------------------------------------------------------------
@@ -144,7 +162,7 @@ class SoC(p: CoreParams) extends Module {
   // UART
   // -------------------------------------------------------------------------
   uart.io.tx_data  := core.io.dcache_wdata(7, 0)
-  uart.io.tx_valid := core.io.dcache_valid && core.io.dcache_wen && uart_sel
+  uart.io.tx_valid := uart_write && uart.io.tx_ready
   uart.io.rx       := io.uart_rx
 
   io.uart_tx := uart.io.tx

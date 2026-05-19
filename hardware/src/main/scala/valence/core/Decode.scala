@@ -3,7 +3,6 @@ package valence.core
 import chisel3._
 import chisel3.util._
 import valence.execution.ALU
-import valence.execution.BranchUnit
 
 // Instruction opcodes
 object Opcode {
@@ -21,23 +20,23 @@ object Opcode {
 }
 
 class DecodeOut extends Bundle {
-  val rs1     = UInt(5.W)
-  val rs2     = UInt(5.W)
-  val rd      = UInt(5.W)
-  val imm     = UInt(64.W)
-  val aluOp   = UInt(4.W)
-  val brOp    = UInt(3.W)
-  val memOp   = UInt(3.W)  // LOAD/STORE funct3: width + signedness
-  val isLoad  = Bool()
-  val isStore = Bool()
-  val isBranch= Bool()
-  val isJal   = Bool()
-  val isJalr  = Bool()
-  val isLui   = Bool()
-  val isAuipc = Bool()
-  val isCsr   = Bool()
-  val useImm  = Bool()
-  val valid   = Bool()
+  val rs1      = UInt(5.W)
+  val rs2      = UInt(5.W)
+  val rd       = UInt(5.W)
+  val imm      = UInt(64.W)
+  val aluOp    = UInt(4.W)
+  val brOp     = UInt(3.W)
+  val memOp    = UInt(3.W) // LOAD/STORE funct3: width + signedness
+  val isLoad   = Bool()
+  val isStore  = Bool()
+  val isBranch = Bool()
+  val isJal    = Bool()
+  val isJalr   = Bool()
+  val isLui    = Bool()
+  val isAuipc  = Bool()
+  val isCsr    = Bool()
+  val useImm   = Bool()
+  val valid    = Bool()
 }
 
 class Decode extends Module {
@@ -54,19 +53,29 @@ class Decode extends Module {
   val rs2    = instr(24, 20)
   val funct7 = instr(31, 25)
 
-  // immediate decode
+  // Immediate decode
   val immI = Cat(Fill(52, instr(31)), instr(31, 20))
   val immS = Cat(Fill(52, instr(31)), instr(31, 25), instr(11, 7))
   val immB = Cat(Fill(51, instr(31)), instr(31), instr(7), instr(30, 25), instr(11, 8), 0.U(1.W))
   val immU = Cat(Fill(32, instr(31)), instr(31, 12), 0.U(12.W))
   val immJ = Cat(Fill(43, instr(31)), instr(31), instr(19, 12), instr(20), instr(30, 21), 0.U(1.W))
 
+  val writesRd =
+    opcode === Opcode.LUI    ||
+    opcode === Opcode.AUIPC  ||
+    opcode === Opcode.JAL    ||
+    opcode === Opcode.JALR   ||
+    opcode === Opcode.LOAD   ||
+    opcode === Opcode.OP_IMM ||
+    opcode === Opcode.OP
+
   val out = io.out
 
   out.rs1      := rs1
   out.rs2      := rs2
-  out.rd       := rd
+  out.rd       := Mux(writesRd, rd, 0.U)
   out.memOp    := funct3
+
   out.isLoad   := opcode === Opcode.LOAD
   out.isStore  := opcode === Opcode.STORE
   out.isBranch := opcode === Opcode.BRANCH
@@ -77,16 +86,16 @@ class Decode extends Module {
   out.isCsr    := opcode === Opcode.SYSTEM
   out.valid    := true.B
 
-  // immediate selection
+  // Immediate selection
   out.imm := MuxCase(immI, Seq(
     (opcode === Opcode.STORE)  -> immS,
     (opcode === Opcode.BRANCH) -> immB,
     (opcode === Opcode.LUI)    -> immU,
     (opcode === Opcode.AUIPC)  -> immU,
-    (opcode === Opcode.JAL)    -> immJ,
+    (opcode === Opcode.JAL)    -> immJ
   ))
 
-  // use immediate for ALU?
+  // Use immediate for ALU?
   out.useImm := opcode === Opcode.OP_IMM ||
                 opcode === Opcode.LOAD   ||
                 opcode === Opcode.STORE  ||
@@ -96,8 +105,11 @@ class Decode extends Module {
   out.aluOp := MuxCase(ALU.ADD.U, Seq(
     (opcode === Opcode.LUI)                                -> ALU.ADD.U,
     (opcode === Opcode.AUIPC)                              -> ALU.ADD.U,
-    ((opcode === Opcode.OP || opcode === Opcode.OP_IMM) &&
+
+    // SUB is only OP, not OP_IMM. OP_IMM funct3=000 is ADDI.
+    ((opcode === Opcode.OP) &&
       funct3 === "b000".U && funct7 === "b0100000".U)      -> ALU.SUB.U,
+
     ((opcode === Opcode.OP || opcode === Opcode.OP_IMM) &&
       funct3 === "b111".U)                                 -> ALU.AND.U,
     ((opcode === Opcode.OP || opcode === Opcode.OP_IMM) &&
@@ -113,9 +125,9 @@ class Decode extends Module {
     ((opcode === Opcode.OP || opcode === Opcode.OP_IMM) &&
       funct3 === "b010".U)                                 -> ALU.SLT.U,
     ((opcode === Opcode.OP || opcode === Opcode.OP_IMM) &&
-      funct3 === "b011".U)                                 -> ALU.SLTU.U,
+      funct3 === "b011".U)                                 -> ALU.SLTU.U
   ))
 
-  // branch op
+  // Branch op uses raw RISC-V funct3.
   out.brOp := funct3
 }

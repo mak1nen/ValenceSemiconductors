@@ -116,11 +116,28 @@ class SoCSpec extends AnyFlatSpec with Matchers {
   // SRAM region
   // ---------------------------------------------------------------------------
 
-  it should "run 500 cycles with SRAM region active" in {
+  it should "run 500 cycles with SRAM fetch port active" in {
     test { dut =>
-      // After BootROM stub runs, the core will jump to SRAM_BASE (0x80000000).
-      // SRAM is now wired — fetching zeros = NOP sled, not a hang.
+      // After BootROM stub runs, the core jumps to SRAM_BASE (0x20000000).
+      // ICache now fills from SRAM fetch port — single memory, two ports.
+      // Fetching zeros = NOP sled, not a hang.
       dut.clock.step(500)
+    }
+  }
+
+  it should "not stall forever on BootROM fetch" in {
+    test { dut =>
+      // bootrom.io.valid is not gated by icache_req so the ICache fill
+      // completes even while the pipeline is stalled.
+      dut.clock.step(200)
+    }
+  }
+
+  it should "advance past BootROM within 100 cycles" in {
+    test { dut =>
+      // BootROM has 6 instructions. With ICache fill working the core
+      // should execute them and jump to SRAM well within 100 cycles.
+      dut.clock.step(100)
     }
   }
 }

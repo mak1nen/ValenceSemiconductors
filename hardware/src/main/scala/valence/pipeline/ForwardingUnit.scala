@@ -3,40 +3,61 @@ package valence.pipeline
 import chisel3._
 import chisel3.util._
 
+// =============================================================================
 // ForwardingUnit — resolves RAW hazards without stalling
 //
-// When EX stage needs a value that hasn't been written back yet,
-// forward it directly from the pipeline register that has it:
+// Forwards results from later pipeline stages back to the ID/EX input
+// so dependent instructions don't read stale register file values.
 //
-//   ADD r1, r2, r3   ← MEM stage (result ready)
-//   ADD r4, r1, r5   ← EX  stage (needs r1)
-//   → forward MEM result directly to ALU input A
+// Three forwarding paths (priority: EX > MEM > WB):
 //
-// Priority: MEM forwarding > WB forwarding
-// (MEM is more recent than WB)
+//   EX forwarding  (FWD_EX):
+//     Instruction in EX stage just computed a result.
+//     Forward directly to the next instruction entering EX.
+//     Covers 1-cycle gaps:
+//       addi sp, sp, -16   ← EX (result ready this cycle)
+//       sd   ra, 8(sp)     ← ID (needs sp)
+//
+//   MEM forwarding (FWD_MEM):
+//     Instruction passed through EX, result in EX/MEM register.
+//     Covers 2-cycle gaps.
+//
+//   WB forwarding  (FWD_WB):
+//     Instruction in MEM/WB stage, about to write back.
+//     Covers 3-cycle gaps.
+//
+// Load-use hazards (1-cycle gap after a load) cannot be forwarded —
+// the HazardUnit inserts a stall bubble instead.
 //
 // Forward select encoding:
-//   NO_FWD = 0 → use register file output
-//   FWD_MEM = 1 → use MEM stage result
-//   FWD_WB  = 2 → use WB stage result
+//   NO_FWD  = 0 → use register file output
+//   FWD_EX  = 1 → use EX stage result
+//   FWD_MEM = 2 → use MEM stage result
+//   FWD_WB  = 3 → use WB stage result
+// =============================================================================
 
 object ForwardingUnit {
   val NO_FWD  = 0
-  val FWD_MEM = 1
-  val FWD_WB  = 2
+  val FWD_EX  = 1
+  val FWD_MEM = 2
+  val FWD_WB  = 3
 }
 
 class ForwardingUnit extends Module {
   val io = IO(new Bundle {
-    // source registers of instruction in EX stage
+    // source registers of instruction currently in ID (about to enter EX)
     val ex_rs1  = Input(UInt(5.W))
     val ex_rs2  = Input(UInt(5.W))
 
-    // MEM stage destination
+    // EX stage destination (id_ex register output)
+    val ex_rd   = Input(UInt(5.W))
+    val ex_wen  = Input(Bool())
+
+    // MEM stage destination (ex_mem register output)
     val mem_rd  = Input(UInt(5.W))
     val mem_wen = Input(Bool())
 
-    // WB stage destination
+    // WB stage destination (mem_wb register output)
     val wb_rd   = Input(UInt(5.W))
     val wb_wen  = Input(Bool())
 
@@ -45,21 +66,17 @@ class ForwardingUnit extends Module {
     val fwd_b   = Output(UInt(2.W))
   })
 
-  // forward A (rs1)
+  // forward A (rs1) — EX takes priority over MEM over WB
   io.fwd_a := MuxCase(ForwardingUnit.NO_FWD.U, Seq(
-    // MEM takes priority — most recent result
-    (io.mem_wen && io.mem_rd =/= 0.U &&
-     io.mem_rd === io.ex_rs1)            -> ForwardingUnit.FWD_MEM.U,
-    // WB next
-    (io.wb_wen && io.wb_rd =/= 0.U &&
-     io.wb_rd === io.ex_rs1)             -> ForwardingUnit.FWD_WB.U,
+    (io.ex_wen  && io.ex_rd  =/= 0.U && io.ex_rd  === io.ex_rs1) -> ForwardingUnit.FWD_EX.U,
+    (io.mem_wen && io.mem_rd =/= 0.U && io.mem_rd === io.ex_rs1) -> ForwardingUnit.FWD_MEM.U,
+    (io.wb_wen  && io.wb_rd  =/= 0.U && io.wb_rd  === io.ex_rs1) -> ForwardingUnit.FWD_WB.U,
   ))
 
   // forward B (rs2)
   io.fwd_b := MuxCase(ForwardingUnit.NO_FWD.U, Seq(
-    (io.mem_wen && io.mem_rd =/= 0.U &&
-     io.mem_rd === io.ex_rs2)            -> ForwardingUnit.FWD_MEM.U,
-    (io.wb_wen && io.wb_rd =/= 0.U &&
-     io.wb_rd === io.ex_rs2)             -> ForwardingUnit.FWD_WB.U,
+    (io.ex_wen  && io.ex_rd  =/= 0.U && io.ex_rd  === io.ex_rs2) -> ForwardingUnit.FWD_EX.U,
+    (io.mem_wen && io.mem_rd =/= 0.U && io.mem_rd === io.ex_rs2) -> ForwardingUnit.FWD_MEM.U,
+    (io.wb_wen  && io.wb_rd  =/= 0.U && io.wb_rd  === io.ex_rs2) -> ForwardingUnit.FWD_WB.U,
   ))
 }

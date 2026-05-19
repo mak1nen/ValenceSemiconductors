@@ -24,11 +24,13 @@ class Core(p: CoreParams) extends Module {
     val dcache_stall = Input(Bool())
 
     // interrupts
-    val timer_irq   = Input(Bool())
-    val soft_irq    = Input(Bool())
+    val timer_irq = Input(Bool())
+    val soft_irq  = Input(Bool())
   })
 
-  // pipeline stages
+  // ---------------------------------------------------------------------------
+  // Pipeline stages
+  // ---------------------------------------------------------------------------
   val frontend  = Module(new Frontend)
   val decode    = Module(new Decode)
   val regfile   = Module(new RegFile(p.xlen))
@@ -39,23 +41,41 @@ class Core(p: CoreParams) extends Module {
   val forward   = Module(new ForwardingUnit)
   val csr       = Module(new CSRFile(p.xlen))
 
-  // pipeline registers
+  // ---------------------------------------------------------------------------
+  // Pipeline registers
+  // ---------------------------------------------------------------------------
   val if_id  = Module(new PipelineReg(new IFIDReg))
   val id_ex  = Module(new PipelineReg(new IDEXReg))
   val ex_mem = Module(new PipelineReg(new EXMEMReg))
   val mem_wb = Module(new PipelineReg(new MEMWBReg))
 
-  // hazard control
-  hazard.io.id_rs1       := decode.io.out.rs1
-  hazard.io.id_rs2       := decode.io.out.rs2
-  hazard.io.ex_rd        := id_ex.io.out.rd
-  hazard.io.ex_is_load   := id_ex.io.out.isLoad
-  hazard.io.mem_rd       := ex_mem.io.out.rd
-  hazard.io.mem_wen      := ex_mem.io.out.valid
+  // ---------------------------------------------------------------------------
+  // Hazard control
+  // ---------------------------------------------------------------------------
+  hazard.io.id_rs1 := decode.io.out.rs1
+  hazard.io.id_rs2 := decode.io.out.rs2
+
+  hazard.io.ex_rd      := id_ex.io.out.rd
+  hazard.io.ex_is_load := id_ex.io.out.isLoad && id_ex.io.out.valid
+
+  hazard.io.mem_rd      := ex_mem.io.out.rd
+  hazard.io.mem_wen     := ex_mem.io.out.valid
+  hazard.io.mem_is_load := ex_mem.io.out.isLoad && ex_mem.io.out.valid
+
   hazard.io.branch_taken := execute.io.out.branch_taken
 
-  // frontend
-  frontend.io.stall        := hazard.io.stall
+  // Memory-stage backpressure.
+  //
+  // This is asserted by SoC.scala when, for example, software writes UART while
+  // the UART transmitter is busy. The pending memory operation must remain held
+  // in EX/MEM until the memory/peripheral accepts it.
+  val mem_stall  = io.dcache_stall
+  val pipe_stall = hazard.io.stall || mem_stall
+
+  // ---------------------------------------------------------------------------
+  // Frontend
+  // ---------------------------------------------------------------------------
+  frontend.io.stall        := pipe_stall
   frontend.io.flush        := hazard.io.flush
   frontend.io.redirect     := execute.io.out.branch_taken
   frontend.io.target       := execute.io.out.branch_target
@@ -65,45 +85,62 @@ class Core(p: CoreParams) extends Module {
   io.icache_addr := frontend.io.pc
   io.icache_req  := frontend.io.req
 
+  // ---------------------------------------------------------------------------
   // IF/ID register
-  if_id.io.stall    := hazard.io.stall
+  // ---------------------------------------------------------------------------
+  if_id.io.stall    := pipe_stall
   if_id.io.flush    := hazard.io.flush
   if_id.io.in.pc    := frontend.io.out_pc
   if_id.io.in.instr := frontend.io.out_instr
   if_id.io.in.valid := frontend.io.out_valid
 
-  // decode
+  // ---------------------------------------------------------------------------
+  // Decode
+  // ---------------------------------------------------------------------------
   decode.io.instr := if_id.io.out.instr
 
-  // register file read
+  // ---------------------------------------------------------------------------
+  // Register file read
+  // ---------------------------------------------------------------------------
   regfile.io.raddr1 := decode.io.out.rs1
   regfile.io.raddr2 := decode.io.out.rs2
 
-  // forwarding — three paths: EX, MEM, WB
-  // JAL/JALR write ra even when flushed — use isJal/isJalr to enable forwarding
-  forward.io.ex_rs1  := decode.io.out.rs1
-  forward.io.ex_rs2  := decode.io.out.rs2
-  forward.io.ex_rd   := id_ex.io.out.rd
-  forward.io.ex_wen  := id_ex.io.out.valid || id_ex.io.out.isJal || id_ex.io.out.isJalr
+  // ---------------------------------------------------------------------------
+  // Forwarding
+  // ---------------------------------------------------------------------------
+  forward.io.ex_rs1 := decode.io.out.rs1
+  forward.io.ex_rs2 := decode.io.out.rs2
+
+  forward.io.ex_rd  := id_ex.io.out.rd
+  forward.io.ex_wen := id_ex.io.out.valid || id_ex.io.out.isJal || id_ex.io.out.isJalr
+
   forward.io.mem_rd  := ex_mem.io.out.rd
   forward.io.mem_wen := ex_mem.io.out.valid
-  forward.io.wb_rd   := mem_wb.io.out.rd
-  forward.io.wb_wen  := mem_wb.io.out.valid
+
+  forward.io.wb_rd  := mem_wb.io.out.rd
+  forward.io.wb_wen := mem_wb.io.out.valid
 
   val fwd_rs1 = MuxLookup(forward.io.fwd_a, regfile.io.rdata1)(Seq(
     ForwardingUnit.FWD_EX.U  -> execute.io.out.result,
     ForwardingUnit.FWD_MEM.U -> memory.io.out.result,
-    ForwardingUnit.FWD_WB.U  -> mem_wb.io.out.result,
+    ForwardingUnit.FWD_WB.U  -> mem_wb.io.out.result
   ))
 
   val fwd_rs2 = MuxLookup(forward.io.fwd_b, regfile.io.rdata2)(Seq(
     ForwardingUnit.FWD_EX.U  -> execute.io.out.result,
     ForwardingUnit.FWD_MEM.U -> memory.io.out.result,
-    ForwardingUnit.FWD_WB.U  -> mem_wb.io.out.result,
+    ForwardingUnit.FWD_WB.U  -> mem_wb.io.out.result
   ))
+
+  // ---------------------------------------------------------------------------
   // ID/EX register
-  id_ex.io.stall       := false.B
-  id_ex.io.flush       := hazard.io.stall || hazard.io.flush
+  //
+  // On normal load-use hazard, insert a bubble.
+  // On memory/peripheral stall, hold ID/EX so decode/execute do not run ahead.
+  // ---------------------------------------------------------------------------
+  id_ex.io.stall := mem_stall
+  id_ex.io.flush := hazard.io.stall || hazard.io.flush
+
   id_ex.io.in.pc       := if_id.io.out.pc
   id_ex.io.in.rs1_val  := fwd_rs1
   id_ex.io.in.rs2_val  := fwd_rs2
@@ -123,23 +160,34 @@ class Core(p: CoreParams) extends Module {
   id_ex.io.in.isCsr    := decode.io.out.isCsr
   id_ex.io.in.valid    := if_id.io.out.valid && !hazard.io.stall
 
-  // execute
+  // ---------------------------------------------------------------------------
+  // Execute
+  // ---------------------------------------------------------------------------
   execute.io.in := id_ex.io.out
 
+  // ---------------------------------------------------------------------------
   // EX/MEM register
-  // JAL/JALR write ra even when branch_taken causes a flush.
-  // Preserve their valid bit so the writeback path stores the return address.
-  ex_mem.io.stall      := false.B
-  ex_mem.io.flush      := false.B
+  //
+  // This is the critical fix for UART backpressure:
+  // when dcache_stall is high, hold the memory-stage operation in EX/MEM.
+  // Otherwise the UART store disappears before uart.tx_ready comes back.
+  // ---------------------------------------------------------------------------
+  ex_mem.io.stall := mem_stall
+  ex_mem.io.flush := false.B
+
   ex_mem.io.in.result  := execute.io.out.result
   ex_mem.io.in.rd      := execute.io.out.rd
   ex_mem.io.in.rs2_val := execute.io.out.rs2_val
   ex_mem.io.in.memOp   := execute.io.out.memOp
   ex_mem.io.in.isLoad  := execute.io.out.isLoad
   ex_mem.io.in.isStore := execute.io.out.isStore && execute.io.out.valid
-  ex_mem.io.in.valid   := execute.io.out.valid || (id_ex.io.out.isJal || id_ex.io.out.isJalr)
 
-  // memory
+  // JAL/JALR produce a writeback result even though they redirect control flow.
+  ex_mem.io.in.valid := execute.io.out.valid || id_ex.io.out.isJal || id_ex.io.out.isJalr
+
+  // ---------------------------------------------------------------------------
+  // Memory
+  // ---------------------------------------------------------------------------
   memory.io.in           := ex_mem.io.out
   memory.io.dcache_rdata := io.dcache_rdata
   memory.io.dcache_stall := io.dcache_stall
@@ -150,21 +198,30 @@ class Core(p: CoreParams) extends Module {
   io.dcache_wstrb := memory.io.dcache_wstrb
   io.dcache_valid := memory.io.dcache_valid
 
+  // ---------------------------------------------------------------------------
   // MEM/WB register
+  //
+  // Let writeback drain even while the memory stage is stalled.
+  // memory.io.out.valid is already suppressed during dcache_stall.
+  // ---------------------------------------------------------------------------
   mem_wb.io.stall     := false.B
   mem_wb.io.flush     := false.B
   mem_wb.io.in.result := memory.io.out.result
   mem_wb.io.in.rd     := memory.io.out.rd
   mem_wb.io.in.valid  := memory.io.out.valid
 
-  // writeback
+  // ---------------------------------------------------------------------------
+  // Writeback
+  // ---------------------------------------------------------------------------
   writeback.io.in := mem_wb.io.out
 
   regfile.io.wen   := writeback.io.wen
   regfile.io.waddr := writeback.io.waddr
   regfile.io.wdata := writeback.io.wdata
 
-  // CSR
+  // ---------------------------------------------------------------------------
+  // CSR placeholder
+  // ---------------------------------------------------------------------------
   csr.io.wen       := false.B
   csr.io.addr      := 0.U
   csr.io.wdata     := 0.U
@@ -173,7 +230,9 @@ class Core(p: CoreParams) extends Module {
   csr.io.cause     := 7.U
 }
 
+// -----------------------------------------------------------------------------
 // Pipeline register data types
+// -----------------------------------------------------------------------------
 class IFIDReg extends Bundle {
   val pc    = UInt(64.W)
   val instr = UInt(32.W)
