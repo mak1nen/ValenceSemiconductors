@@ -40,6 +40,7 @@ class Core(p: CoreParams) extends Module {
   val hazard    = Module(new HazardUnit)
   val forward   = Module(new ForwardingUnit)
   val csr       = Module(new CSRFile(p.xlen))
+  val trap      = Module(new TrapUnit(p.xlen))
 
   // ---------------------------------------------------------------------------
   // Pipeline registers
@@ -220,14 +221,57 @@ class Core(p: CoreParams) extends Module {
   regfile.io.wdata := writeback.io.wdata
 
   // ---------------------------------------------------------------------------
-  // CSR placeholder
+  // CSR + TrapUnit — Phase 0 stub
+  //
+  // CSRFile and TrapUnit are both instantiated but trap handling is not
+  // yet integrated into the pipeline. Inputs are driven to safe defaults
+  // so the design compiles and behavior is unchanged from before these
+  // modules existed:
+  //
+  //   - takeTrap is forced false on the CSR side, so no trap ever fires
+  //   - CSR instructions don't execute (wen forced false)
+  //   - Interrupt input lines still route to CSRFile.mip so software
+  //     reads of mip see them
+  //   - TrapUnit reads real mstatus/mie/mtvec/mepc from CSRFile, so when
+  //     we wire it in later those reads already work
+  //
+  // To be replaced in Phase 1-3:
+  //   - decode mret/ecall/ebreak as distinct DecodeOut signals
+  //   - carry pc, instr, exception flags through EX/MEM/WB pipeline regs
+  //   - implement CSR instruction read/write
+  //   - wire TrapUnit at WB stage with real exception sources
+  //   - merge trap redirect into frontend with priority over branch
   // ---------------------------------------------------------------------------
+
+  csr.io.addr      := 0.U(12.W)
   csr.io.wen       := false.B
-  csr.io.addr      := 0.U
-  csr.io.wdata     := 0.U
-  csr.io.exception := io.timer_irq
-  csr.io.epc       := frontend.io.out_pc
-  csr.io.cause     := 7.U
+  csr.io.wdata     := 0.U(p.xlen.W)
+  csr.io.takeTrap  := false.B
+  csr.io.trapEpc   := 0.U(p.xlen.W)
+  csr.io.trapCause := 0.U(p.xlen.W)
+  csr.io.trapTval  := 0.U(p.xlen.W)
+  csr.io.takeMret  := false.B
+  csr.io.mtipIn    := io.timer_irq
+  csr.io.msipIn    := io.soft_irq
+  csr.io.meipIn    := false.B
+
+  trap.io.pc                       := 0.U(p.xlen.W)
+  trap.io.instr                    := 0.U(32.W)
+  trap.io.illegalInstr             := false.B
+  trap.io.ecall                    := false.B
+  trap.io.ebreak                   := false.B
+  trap.io.instrAddrMisaligned      := false.B
+  trap.io.loadAddrMisaligned       := false.B
+  trap.io.storeAddrMisaligned      := false.B
+  trap.io.badAddr                  := 0.U(p.xlen.W)
+  trap.io.mret                     := false.B
+  trap.io.mtvec                    := csr.io.mtvec
+  trap.io.mepc                     := csr.io.mepc
+  trap.io.mstatus                  := csr.io.mstatus
+  trap.io.mie                      := csr.io.mie
+  trap.io.machineSoftwareInterrupt := io.soft_irq
+  trap.io.machineTimerInterrupt    := io.timer_irq
+  trap.io.machineExternalInterrupt := false.B
 }
 
 // -----------------------------------------------------------------------------
@@ -245,7 +289,7 @@ class IDEXReg extends Bundle {
   val rs2_val  = UInt(64.W)
   val imm      = UInt(64.W)
   val rd       = UInt(5.W)
-  val aluOp    = UInt(4.W)
+  val aluOp    = UInt(5.W)
   val brOp     = UInt(3.W)
   val memOp    = UInt(3.W)
   val useImm   = Bool()

@@ -2,21 +2,23 @@ package valence.core
 
 import chisel3._
 import chisel3.util._
-import valence.execution.ALU
+import valence.execution.{ALU, MulDivOp}
 
 // Instruction opcodes
 object Opcode {
-  val LUI    = "b0110111".U(7.W)
-  val AUIPC  = "b0010111".U(7.W)
-  val JAL    = "b1101111".U(7.W)
-  val JALR   = "b1100111".U(7.W)
-  val BRANCH = "b1100011".U(7.W)
-  val LOAD   = "b0000011".U(7.W)
-  val STORE  = "b0100011".U(7.W)
-  val OP_IMM = "b0010011".U(7.W)
-  val OP     = "b0110011".U(7.W)
-  val SYSTEM = "b1110011".U(7.W)
-  val FENCE  = "b0001111".U(7.W)
+  val LUI        = "b0110111".U(7.W)
+  val AUIPC      = "b0010111".U(7.W)
+  val JAL        = "b1101111".U(7.W)
+  val JALR       = "b1100111".U(7.W)
+  val BRANCH     = "b1100011".U(7.W)
+  val LOAD       = "b0000011".U(7.W)
+  val STORE      = "b0100011".U(7.W)
+  val OP_IMM     = "b0010011".U(7.W)
+  val OP         = "b0110011".U(7.W)
+  val OP_IMM_32  = "b0011011".U(7.W)  // ADDIW, SLLIW, SRLIW, SRAIW
+  val OP_32      = "b0111011".U(7.W)  // ADDW, SUBW, SLLW, SRLW, SRAW, MULW, DIVW, ...
+  val SYSTEM     = "b1110011".U(7.W)
+  val FENCE      = "b0001111".U(7.W)
 }
 
 class DecodeOut extends Bundle {
@@ -24,9 +26,11 @@ class DecodeOut extends Bundle {
   val rs2      = UInt(5.W)
   val rd       = UInt(5.W)
   val imm      = UInt(64.W)
-  val aluOp    = UInt(4.W)
+  val aluOp    = UInt(5.W)
+  val mulDivOp = UInt(5.W)
   val brOp     = UInt(3.W)
-  val memOp    = UInt(3.W) // LOAD/STORE funct3: width + signedness
+  val memOp    = UInt(3.W)
+
   val isLoad   = Bool()
   val isStore  = Bool()
   val isBranch = Bool()
@@ -35,6 +39,8 @@ class DecodeOut extends Bundle {
   val isLui    = Bool()
   val isAuipc  = Bool()
   val isCsr    = Bool()
+  val isMulDiv = Bool()
+
   val useImm   = Bool()
   val valid    = Bool()
 }
@@ -52,6 +58,16 @@ class Decode extends Module {
   val rs1    = instr(19, 15)
   val rs2    = instr(24, 20)
   val funct7 = instr(31, 25)
+  val funct6 = instr(31, 26) // RV64 OP-IMM shift-immediate function field
+
+  val isOp      = opcode === Opcode.OP
+  val isOpImm   = opcode === Opcode.OP_IMM
+  val isOp32    = opcode === Opcode.OP_32
+  val isOpImm32 = opcode === Opcode.OP_IMM_32
+
+  val isMulDivInstr =
+    (isOp || isOp32) &&
+    funct7 === "b0000001".U
 
   // Immediate decode
   val immI = Cat(Fill(52, instr(31)), instr(31, 20))
@@ -66,8 +82,10 @@ class Decode extends Module {
     opcode === Opcode.JAL    ||
     opcode === Opcode.JALR   ||
     opcode === Opcode.LOAD   ||
-    opcode === Opcode.OP_IMM ||
-    opcode === Opcode.OP
+    isOpImm                  ||
+    isOp                     ||
+    isOpImm32                ||
+    isOp32
 
   val out = io.out
 
@@ -84,6 +102,7 @@ class Decode extends Module {
   out.isLui    := opcode === Opcode.LUI
   out.isAuipc  := opcode === Opcode.AUIPC
   out.isCsr    := opcode === Opcode.SYSTEM
+  out.isMulDiv := isMulDivInstr
   out.valid    := true.B
 
   // Immediate selection
@@ -93,40 +112,136 @@ class Decode extends Module {
     (opcode === Opcode.LUI)    -> immU,
     (opcode === Opcode.AUIPC)  -> immU,
     (opcode === Opcode.JAL)    -> immJ
+    // OP_IMM, OP_IMM_32, LOAD, JALR all use immI by default
   ))
 
-  // Use immediate for ALU?
-  out.useImm := opcode === Opcode.OP_IMM ||
+  // Use immediate for ALU input B?
+  out.useImm := isOpImm                  ||
+                isOpImm32                ||
                 opcode === Opcode.LOAD   ||
                 opcode === Opcode.STORE  ||
                 opcode === Opcode.JALR
 
   // ALU op decode
   out.aluOp := MuxCase(ALU.ADD.U, Seq(
+    // LUI/AUIPC can use ADD-style datapath handling.
     (opcode === Opcode.LUI)                                -> ALU.ADD.U,
     (opcode === Opcode.AUIPC)                              -> ALU.ADD.U,
 
-    // SUB is only OP, not OP_IMM. OP_IMM funct3=000 is ADDI.
-    ((opcode === Opcode.OP) &&
+    // ---- 64-bit OP ----
+    ((isOp) &&
+      funct3 === "b000".U && funct7 === "b0000000".U)      -> ALU.ADD.U,
+
+    ((isOp) &&
       funct3 === "b000".U && funct7 === "b0100000".U)      -> ALU.SUB.U,
 
-    ((opcode === Opcode.OP || opcode === Opcode.OP_IMM) &&
-      funct3 === "b111".U)                                 -> ALU.AND.U,
-    ((opcode === Opcode.OP || opcode === Opcode.OP_IMM) &&
-      funct3 === "b110".U)                                 -> ALU.OR.U,
-    ((opcode === Opcode.OP || opcode === Opcode.OP_IMM) &&
-      funct3 === "b100".U)                                 -> ALU.XOR.U,
-    ((opcode === Opcode.OP || opcode === Opcode.OP_IMM) &&
-      funct3 === "b001".U)                                 -> ALU.SLL.U,
-    ((opcode === Opcode.OP || opcode === Opcode.OP_IMM) &&
+    ((isOp) &&
+      funct3 === "b111".U && funct7 === "b0000000".U)      -> ALU.AND.U,
+
+    ((isOp) &&
+      funct3 === "b110".U && funct7 === "b0000000".U)      -> ALU.OR.U,
+
+    ((isOp) &&
+      funct3 === "b100".U && funct7 === "b0000000".U)      -> ALU.XOR.U,
+
+    ((isOp) &&
+      funct3 === "b001".U && funct7 === "b0000000".U)      -> ALU.SLL.U,
+
+    ((isOp) &&
       funct3 === "b101".U && funct7 === "b0000000".U)      -> ALU.SRL.U,
-    ((opcode === Opcode.OP || opcode === Opcode.OP_IMM) &&
+
+    ((isOp) &&
       funct3 === "b101".U && funct7 === "b0100000".U)      -> ALU.SRA.U,
-    ((opcode === Opcode.OP || opcode === Opcode.OP_IMM) &&
-      funct3 === "b010".U)                                 -> ALU.SLT.U,
-    ((opcode === Opcode.OP || opcode === Opcode.OP_IMM) &&
-      funct3 === "b011".U)                                 -> ALU.SLTU.U
+
+    ((isOp) &&
+      funct3 === "b010".U && funct7 === "b0000000".U)      -> ALU.SLT.U,
+
+    ((isOp) &&
+      funct3 === "b011".U && funct7 === "b0000000".U)      -> ALU.SLTU.U,
+
+    // ---- 64-bit OP-IMM ----
+    ((isOpImm) &&
+      funct3 === "b000".U)                                 -> ALU.ADD.U,  // ADDI
+
+    ((isOpImm) &&
+      funct3 === "b111".U)                                 -> ALU.AND.U,  // ANDI
+
+    ((isOpImm) &&
+      funct3 === "b110".U)                                 -> ALU.OR.U,   // ORI
+
+    ((isOpImm) &&
+      funct3 === "b100".U)                                 -> ALU.XOR.U,  // XORI
+
+    ((isOpImm) &&
+      funct3 === "b001".U && funct6 === "b000000".U)       -> ALU.SLL.U,  // SLLI
+
+    ((isOpImm) &&
+      funct3 === "b101".U && funct6 === "b000000".U)       -> ALU.SRL.U,  // SRLI
+
+    ((isOpImm) &&
+      funct3 === "b101".U && funct6 === "b010000".U)       -> ALU.SRA.U,  // SRAI
+
+    ((isOpImm) &&
+      funct3 === "b010".U)                                 -> ALU.SLT.U,  // SLTI
+
+    ((isOpImm) &&
+      funct3 === "b011".U)                                 -> ALU.SLTU.U, // SLTIU
+
+    // ---- 32-bit OP_32 ----
+    ((isOp32) &&
+      funct3 === "b000".U && funct7 === "b0000000".U)      -> ALU.ADDW.U,
+
+    ((isOp32) &&
+      funct3 === "b000".U && funct7 === "b0100000".U)      -> ALU.SUBW.U,
+
+    ((isOp32) &&
+      funct3 === "b001".U && funct7 === "b0000000".U)      -> ALU.SLLW.U,
+
+    ((isOp32) &&
+      funct3 === "b101".U && funct7 === "b0000000".U)      -> ALU.SRLW.U,
+
+    ((isOp32) &&
+      funct3 === "b101".U && funct7 === "b0100000".U)      -> ALU.SRAW.U,
+
+    // ---- 32-bit OP-IMM-32 ----
+    ((isOpImm32) &&
+      funct3 === "b000".U)                                 -> ALU.ADDW.U, // ADDIW
+
+    ((isOpImm32) &&
+      funct3 === "b001".U && funct7 === "b0000000".U)      -> ALU.SLLW.U, // SLLIW
+
+    ((isOpImm32) &&
+      funct3 === "b101".U && funct7 === "b0000000".U)      -> ALU.SRLW.U, // SRLIW
+
+    ((isOpImm32) &&
+      funct3 === "b101".U && funct7 === "b0100000".U)      -> ALU.SRAW.U  // SRAIW
   ))
+
+  // MUL/DIV decode
+  out.mulDivOp := 0.U
+
+  when (isMulDivInstr) {
+    when (isOp) {
+      switch(funct3) {
+        is("b000".U) { out.mulDivOp := MulDivOp.MUL.U }
+        is("b001".U) { out.mulDivOp := MulDivOp.MULH.U }
+        is("b010".U) { out.mulDivOp := MulDivOp.MULHSU.U }
+        is("b011".U) { out.mulDivOp := MulDivOp.MULHU.U }
+        is("b100".U) { out.mulDivOp := MulDivOp.DIV.U }
+        is("b101".U) { out.mulDivOp := MulDivOp.DIVU.U }
+        is("b110".U) { out.mulDivOp := MulDivOp.REM.U }
+        is("b111".U) { out.mulDivOp := MulDivOp.REMU.U }
+      }
+    } .elsewhen (isOp32) {
+      switch(funct3) {
+        is("b000".U) { out.mulDivOp := MulDivOp.MULW.U }
+        is("b100".U) { out.mulDivOp := MulDivOp.DIVW.U }
+        is("b101".U) { out.mulDivOp := MulDivOp.DIVUW.U }
+        is("b110".U) { out.mulDivOp := MulDivOp.REMW.U }
+        is("b111".U) { out.mulDivOp := MulDivOp.REMUW.U }
+      }
+    }
+  }
 
   // Branch op uses raw RISC-V funct3.
   out.brOp := funct3

@@ -2,17 +2,28 @@ TOP      = SoC
 RTL_DIR  = ../../hardware/generated
 SW_DIR   = ../sw
 CC       = riscv64-unknown-elf-gcc
-CFLAGS   = -march=rv64i -mabi=lp64 -nostdlib -O2
+OBJCOPY  = riscv64-unknown-elf-objcopy
+CFLAGS   = -march=rv64im -mabi=lp64 -nostdlib -O2
+
 VERILATOR_FLAGS = --cc --exe --build \
     --top-module $(TOP) \
     -Wno-WIDTHTRUNC \
     -Wno-WIDTHEXPAND
 
-.PHONY: all sim hello clean
+# default test — override with: make run TEST=002_ipc_bench
+TEST    ?= 000_hello
+CYCLES  ?= 10000000
 
-all: sim hello
+ELF     = $(SW_DIR)/$(TEST).elf
+HEX     = $(SW_DIR)/$(TEST).hex
+SIM     = ./obj_dir/sim_$(TOP)
 
-# compile Verilator sim
+.PHONY: all sim sw run clean
+
+# ── build everything ──────────────────────────────────────────────────────────
+all: sim sw
+
+# ── verilator sim binary ──────────────────────────────────────────────────────
 sim:
 	verilator $(VERILATOR_FLAGS) \
 	    -I$(RTL_DIR) \
@@ -20,18 +31,31 @@ sim:
 	    tb_soc.cpp \
 	    -o sim_$(TOP)
 
-# compile hello.c test
-hello:
+# ── compile a test to hex ─────────────────────────────────────────────────────
+sw: $(HEX)
+
+$(HEX): $(ELF)
+	$(OBJCOPY) -O verilog $< $@
+
+$(ELF): $(SW_DIR)/tests/$(TEST).c $(SW_DIR)/boot/start.S
 	$(CC) $(CFLAGS) \
-	    -T $(SW_DIR)/linker.ld \
+	    -T $(SW_DIR)/linker.id \
 	    $(SW_DIR)/boot/start.S \
-	    $(SW_DIR)/tests/hello.c \
-	    -o hello.elf
-	riscv64-unknown-elf-objcopy -O binary hello.elf hello.bin
+	    $< \
+	    -o $@
 
-# run hello
-run: sim hello
-	./obj_dir/sim_$(TOP) +image=hello.bin +cycles=5000000
+# ── run ───────────────────────────────────────────────────────────────────────
+run: $(HEX)
+	$(SIM) +hex=$(HEX) +cycles=$(CYCLES)
 
+# ── run, strip debug noise ────────────────────────────────────────────────────
+run-clean: $(HEX)
+	$(SIM) +hex=$(HEX) +cycles=$(CYCLES) 2>&1 | grep -v "^\[sim\] cycle\|ra-debug"
+
+# ── clean sw artifacts only ───────────────────────────────────────────────────
+clean-sw:
+	rm -f $(SW_DIR)/*.elf $(SW_DIR)/*.hex
+
+# ── clean everything ──────────────────────────────────────────────────────────
 clean:
-	rm -rf obj_dir *.elf *.bin
+	rm -rf obj_dir $(SW_DIR)/*.elf $(SW_DIR)/*.hex
