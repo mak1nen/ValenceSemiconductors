@@ -30,6 +30,7 @@ class DecodeOut extends Bundle {
   val mulDivOp = UInt(5.W)
   val brOp     = UInt(3.W)
   val memOp    = UInt(3.W)
+  val csrAddr  = UInt(12.W)
 
   val isLoad   = Bool()
   val isStore  = Bool()
@@ -65,6 +66,10 @@ class Decode extends Module {
   val isOp32    = opcode === Opcode.OP_32
   val isOpImm32 = opcode === Opcode.OP_IMM_32
 
+  // CSR instructions are SYSTEM with funct3 != 000.
+  // SYSTEM/funct3 == 000 is ECALL/EBREAK/MRET/etc, not normal CSR read/write.
+  val isCsrInstr = opcode === Opcode.SYSTEM && funct3 =/= "b000".U
+
   val isMulDivInstr =
     (isOp || isOp32) &&
     funct7 === "b0000001".U
@@ -85,7 +90,8 @@ class Decode extends Module {
     isOpImm                  ||
     isOp                     ||
     isOpImm32                ||
-    isOp32
+    isOp32                   ||
+    isCsrInstr
 
   val out = io.out
 
@@ -93,6 +99,7 @@ class Decode extends Module {
   out.rs2      := rs2
   out.rd       := Mux(writesRd, rd, 0.U)
   out.memOp    := funct3
+  out.csrAddr  := instr(31, 20)
 
   out.isLoad   := opcode === Opcode.LOAD
   out.isStore  := opcode === Opcode.STORE
@@ -101,7 +108,7 @@ class Decode extends Module {
   out.isJalr   := opcode === Opcode.JALR
   out.isLui    := opcode === Opcode.LUI
   out.isAuipc  := opcode === Opcode.AUIPC
-  out.isCsr    := opcode === Opcode.SYSTEM
+  out.isCsr    := isCsrInstr
   out.isMulDiv := isMulDivInstr
   out.valid    := true.B
 

@@ -16,6 +16,12 @@ object CSRFile {
   val MIP      = 0x344
   val MHARTID  = 0xF14
 
+  // Counter CSRs
+  val MCYCLE   = 0xB00
+  val MINSTRET = 0xB02
+  val CYCLE    = 0xC00
+  val INSTRET  = 0xC02
+
   // mstatus bit positions (RV64)
   val MSTATUS_MIE_BIT  = 3
   val MSTATUS_MPIE_BIT = 7
@@ -39,6 +45,11 @@ class CSRFile(xlen: Int) extends Module {
     val wen    = Input(Bool())
     val wdata  = Input(UInt(xlen.W))
     val rdata  = Output(UInt(xlen.W))
+
+    // ----- Retire pulse for minstret / instret -----
+    // For now Core.scala can drive this with mem_wb.io.out.valid.
+    // Later, once precise traps are finished, drive it from real commitValid.
+    val retire = Input(Bool())
 
     // ----- Trap entry interface (from TrapUnit) -----
     // When takeTrap asserts, atomically:
@@ -88,6 +99,25 @@ class CSRFile(xlen: Int) extends Module {
   val mtval      = RegInit(0.U(xlen.W))
 
   // --------------------------------------------------------------------------
+  // Counter CSRs
+  //
+  // mcycle/cycle:
+  //   increments every clock
+  //
+  // minstret/instret:
+  //   increments when Core says one instruction retired
+  // --------------------------------------------------------------------------
+
+  val mcycle   = RegInit(0.U(xlen.W))
+  val minstret = RegInit(0.U(xlen.W))
+
+  mcycle := mcycle + 1.U
+
+  when (io.retire) {
+    minstret := minstret + 1.U
+  }
+
+  // --------------------------------------------------------------------------
   // mip register
   //
   // Hardware-driven bits (MTIP, MSIP, MEIP) come from the interrupt source
@@ -96,7 +126,6 @@ class CSRFile(xlen: Int) extends Module {
   // --------------------------------------------------------------------------
 
   val mip = Wire(UInt(xlen.W))
-  mip := 0.U
   mip := Cat(
     0.U((xlen - 12).W),
     io.meipIn,                // bit 11
@@ -160,8 +189,12 @@ class CSRFile(xlen: Int) extends Module {
   }
 
   // --------------------------------------------------------------------------
-  // Software CSR writes (only effective when no trap/mret this cycle and
-  // the trap-entry path isn't writing the same register)
+  // Software CSR writes
+  //
+  // Only effective when no trap/mret this cycle.
+  //
+  // Counter writes are allowed for machine-mode software/debug. For your
+  // current rdcycle benchmark, only reads are needed, but writes are harmless.
   // --------------------------------------------------------------------------
 
   val softwareCanWrite = io.wen && !io.takeTrap && !io.takeMret
@@ -174,11 +207,16 @@ class CSRFile(xlen: Int) extends Module {
       is(CSRFile.MEPC.U)     { mepc     := io.wdata }
       is(CSRFile.MCAUSE.U)   { mcause   := io.wdata }
       is(CSRFile.MTVAL.U)    { mtval    := io.wdata }
+
+      is(CSRFile.MCYCLE.U)   { mcycle   := io.wdata }
+      is(CSRFile.MINSTRET.U) { minstret := io.wdata }
+
       // mstatus handled above
       // mip: software writes to mip in this core are ignored
       //      (hardware-only pending bits)
       // misa: read-only in this core
       // mhartid: read-only
+      // cycle/instret aliases are read-only aliases here
     }
   }
 
@@ -196,7 +234,12 @@ class CSRFile(xlen: Int) extends Module {
     CSRFile.MCAUSE.U   -> mcause,
     CSRFile.MTVAL.U    -> mtval,
     CSRFile.MIP.U      -> mip,
-    CSRFile.MHARTID.U  -> 0.U
+    CSRFile.MHARTID.U  -> 0.U,
+
+    CSRFile.MCYCLE.U   -> mcycle,
+    CSRFile.CYCLE.U    -> mcycle,
+    CSRFile.MINSTRET.U -> minstret,
+    CSRFile.INSTRET.U  -> minstret
   ))
 
   // --------------------------------------------------------------------------

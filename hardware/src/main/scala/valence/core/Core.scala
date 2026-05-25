@@ -51,6 +51,26 @@ class Core(p: CoreParams) extends Module {
   val mem_wb = Module(new PipelineReg(new MEMWBReg))
 
   // ---------------------------------------------------------------------------
+  // CSR read path
+  //
+  // This is enough for rdcycle:
+  //   rdcycle rd == csrrs rd, cycle, x0
+  //
+  // Decode provides:
+  //   isCsr   = SYSTEM && funct3 != 000
+  //   csrAddr = instr[31:20]
+  //
+  // CSR writes are still disabled for now. This is read-only CSR plumbing.
+  // ---------------------------------------------------------------------------
+  csr.io.addr := Mux(id_ex.io.out.isCsr, id_ex.io.out.csrAddr, 0.U(12.W))
+
+  val exStageResult = Mux(
+    id_ex.io.out.isCsr,
+    csr.io.rdata,
+    execute.io.out.result
+  )
+
+  // ---------------------------------------------------------------------------
   // Hazard control
   // ---------------------------------------------------------------------------
   hazard.io.id_rs1 := decode.io.out.rs1
@@ -122,13 +142,13 @@ class Core(p: CoreParams) extends Module {
   forward.io.wb_wen := mem_wb.io.out.valid
 
   val fwd_rs1 = MuxLookup(forward.io.fwd_a, regfile.io.rdata1)(Seq(
-    ForwardingUnit.FWD_EX.U  -> execute.io.out.result,
+    ForwardingUnit.FWD_EX.U  -> exStageResult,
     ForwardingUnit.FWD_MEM.U -> memory.io.out.result,
     ForwardingUnit.FWD_WB.U  -> mem_wb.io.out.result
   ))
 
   val fwd_rs2 = MuxLookup(forward.io.fwd_b, regfile.io.rdata2)(Seq(
-    ForwardingUnit.FWD_EX.U  -> execute.io.out.result,
+    ForwardingUnit.FWD_EX.U  -> exStageResult,
     ForwardingUnit.FWD_MEM.U -> memory.io.out.result,
     ForwardingUnit.FWD_WB.U  -> mem_wb.io.out.result
   ))
@@ -150,6 +170,7 @@ class Core(p: CoreParams) extends Module {
   id_ex.io.in.aluOp    := decode.io.out.aluOp
   id_ex.io.in.brOp     := decode.io.out.brOp
   id_ex.io.in.memOp    := decode.io.out.memOp
+  id_ex.io.in.csrAddr  := decode.io.out.csrAddr
   id_ex.io.in.useImm   := decode.io.out.useImm
   id_ex.io.in.isLoad   := decode.io.out.isLoad
   id_ex.io.in.isStore  := decode.io.out.isStore
@@ -176,15 +197,21 @@ class Core(p: CoreParams) extends Module {
   ex_mem.io.stall := mem_stall
   ex_mem.io.flush := false.B
 
-  ex_mem.io.in.result  := execute.io.out.result
-  ex_mem.io.in.rd      := execute.io.out.rd
+  // CSR read result is injected here for instructions like rdcycle.
+  ex_mem.io.in.result  := exStageResult
+  ex_mem.io.in.rd      := Mux(id_ex.io.out.isCsr, id_ex.io.out.rd, execute.io.out.rd)
   ex_mem.io.in.rs2_val := execute.io.out.rs2_val
   ex_mem.io.in.memOp   := execute.io.out.memOp
   ex_mem.io.in.isLoad  := execute.io.out.isLoad
   ex_mem.io.in.isStore := execute.io.out.isStore && execute.io.out.valid
 
   // JAL/JALR produce a writeback result even though they redirect control flow.
-  ex_mem.io.in.valid := execute.io.out.valid || id_ex.io.out.isJal || id_ex.io.out.isJalr
+  // CSR reads also produce a writeback result.
+  ex_mem.io.in.valid :=
+    execute.io.out.valid ||
+    id_ex.io.out.isJal ||
+    id_ex.io.out.isJalr ||
+    (id_ex.io.out.isCsr && id_ex.io.out.valid)
 
   // ---------------------------------------------------------------------------
   // Memory
@@ -221,31 +248,20 @@ class Core(p: CoreParams) extends Module {
   regfile.io.wdata := writeback.io.wdata
 
   // ---------------------------------------------------------------------------
-  // CSR + TrapUnit — Phase 0 stub
+  // CSR + TrapUnit — Phase 0 stub plus counter support
   //
-  // CSRFile and TrapUnit are both instantiated but trap handling is not
-  // yet integrated into the pipeline. Inputs are driven to safe defaults
-  // so the design compiles and behavior is unchanged from before these
-  // modules existed:
+  // CSR reads are partially integrated so rdcycle/cycle can work.
+  // CSR writes are still disabled for now.
   //
-  //   - takeTrap is forced false on the CSR side, so no trap ever fires
-  //   - CSR instructions don't execute (wen forced false)
-  //   - Interrupt input lines still route to CSRFile.mip so software
-  //     reads of mip see them
-  //   - TrapUnit reads real mstatus/mie/mtvec/mepc from CSRFile, so when
-  //     we wire it in later those reads already work
-  //
-  // To be replaced in Phase 1-3:
-  //   - decode mret/ecall/ebreak as distinct DecodeOut signals
-  //   - carry pc, instr, exception flags through EX/MEM/WB pipeline regs
-  //   - implement CSR instruction read/write
-  //   - wire TrapUnit at WB stage with real exception sources
-  //   - merge trap redirect into frontend with priority over branch
+  // Trap handling is still not integrated into the pipeline.
   // ---------------------------------------------------------------------------
 
-  csr.io.addr      := 0.U(12.W)
   csr.io.wen       := false.B
   csr.io.wdata     := 0.U(p.xlen.W)
+
+  // Count retired instructions. This is approximate until precise commit/traps.
+  csr.io.retire    := mem_wb.io.out.valid
+
   csr.io.takeTrap  := false.B
   csr.io.trapEpc   := 0.U(p.xlen.W)
   csr.io.trapCause := 0.U(p.xlen.W)
@@ -292,6 +308,7 @@ class IDEXReg extends Bundle {
   val aluOp    = UInt(5.W)
   val brOp     = UInt(3.W)
   val memOp    = UInt(3.W)
+  val csrAddr  = UInt(12.W)
   val useImm   = Bool()
   val isLoad   = Bool()
   val isStore  = Bool()

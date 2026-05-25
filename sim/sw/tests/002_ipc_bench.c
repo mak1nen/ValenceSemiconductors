@@ -1,11 +1,11 @@
-// Valence RISC-V — IPC benchmark
+// Valence RISC-V — simple known-instruction IPC benchmark
+// Hex-only version: no divide/remainder in print path.
 
 #define UART_TX (*(volatile unsigned char*)0x10000000UL)
 
-#define N               10000ULL
-#define INSNS_PER_ITER  4ULL
-
-// ── UART ──────────────────────────────────────────────────────────────────────
+#define N 10000ULL
+#define INSNS_PER_ITER 8ULL
+#define TOTAL_INSNS (N * INSNS_PER_ITER)
 
 static void uart_putc(char c) {
     UART_TX = c;
@@ -15,37 +15,17 @@ static void uart_puts(const char* s) {
     while (*s) uart_putc(*s++);
 }
 
-static void uart_putu(unsigned long long v) {
-    char buf[32];
-    int i = 0;
+static void uart_puthex64(unsigned long long v) {
+    for (unsigned int pos = 0; pos < 16; pos++) {
+        unsigned int shift = (15U - pos) * 4U;
+        unsigned int nibble = (v >> shift) & 0xFULL;
 
-    if (v == 0) {
-        uart_putc('0');
-        return;
+        if (nibble < 10)
+            uart_putc('0' + nibble);
+        else
+            uart_putc('a' + nibble - 10);
     }
-
-    while (v > 0) {
-        buf[i++] = '0' + (v % 10);
-        v /= 10;
-    }
-
-    while (i--)
-        uart_putc(buf[i]);
 }
-
-// print fixed-point x1000 value
-static void uart_put_fixed3(unsigned long long v) {
-    uart_putu(v / 1000);
-    uart_putc('.');
-    
-    unsigned long long frac = v % 1000;
-
-    uart_putc('0' + (frac / 100) % 10);
-    uart_putc('0' + (frac / 10) % 10);
-    uart_putc('0' + frac % 10);
-}
-
-// ── cycle counter ─────────────────────────────────────────────────────────────
 
 static inline unsigned long long rdcycle(void) {
     unsigned long long v;
@@ -53,44 +33,81 @@ static inline unsigned long long rdcycle(void) {
     return v;
 }
 
-// ── benchmark ─────────────────────────────────────────────────────────────────
+static inline unsigned long long rdinstret(void) {
+    unsigned long long v;
+    asm volatile ("rdinstret %0" : "=r"(v));
+    return v;
+}
 
 int main(void) {
+    register unsigned long long a asm("t0") = 1;
+    register unsigned long long b asm("t1") = 2;
+    register unsigned long long c asm("t2") = 3;
+    register unsigned long long d asm("t3") = 4;
+    register unsigned long long n asm("t4") = N;
 
-    volatile unsigned long long a = 1;
-    volatile unsigned long long b = 2;
-    volatile unsigned long long c = 3;
-    volatile unsigned long long d = 4;
+    unsigned long long start_cycle = rdcycle();
+    unsigned long long start_instret = rdinstret();
 
-    unsigned long long start = rdcycle();
+    asm volatile (
+        "1:\n"
+        "add  %[a], %[a], %[b]\n"
+        "xor  %[b], %[b], %[c]\n"
+        "srl  %[c], %[c], 1\n"
+        "or   %[d], %[d], %[a]\n"
+        "add  %[a], %[a], %[d]\n"
+        "xor  %[b], %[b], %[a]\n"
+        "addi %[n], %[n], -1\n"
+        "bnez %[n], 1b\n"
+        : [a] "+r"(a),
+          [b] "+r"(b),
+          [c] "+r"(c),
+          [d] "+r"(d),
+          [n] "+r"(n)
+        :
+        : "memory"
+    );
 
-    for (unsigned long long i = 0; i < N; i++) {
+    unsigned long long end_cycle = rdcycle();
+    unsigned long long end_instret = rdinstret();
 
-        a = a + b;   // add
-        b = b ^ c;   // xor
-        c = c >> 1;  // srl
-        d = d | a;   // or
+    unsigned long long cycles = end_cycle - start_cycle;
+    unsigned long long instret = end_instret - start_instret;
+
+    uart_puts("start_cycle=0x");
+    uart_puthex64(start_cycle);
+    uart_puts("\r\n");
+
+    uart_puts("end_cycle=0x");
+    uart_puthex64(end_cycle);
+    uart_puts("\r\n");
+
+    uart_puts("cycles=0x");
+    uart_puthex64(cycles);
+    uart_puts("\r\n");
+
+    uart_puts("start_instret=0x");
+    uart_puthex64(start_instret);
+    uart_puts("\r\n");
+
+    uart_puts("end_instret=0x");
+    uart_puthex64(end_instret);
+    uart_puts("\r\n");
+
+    uart_puts("instret=0x");
+    uart_puthex64(instret);
+    uart_puts("\r\n");
+
+    uart_puts("expected_insns=0x");
+    uart_puthex64(TOTAL_INSNS);
+    uart_puts("\r\n");
+
+    // Prevent compiler from discarding results.
+    if ((a ^ b ^ c ^ d) == 0x12345678ULL) {
+        uart_puts("unlikely\r\n");
     }
 
-    unsigned long long end = rdcycle();
-
-    unsigned long long cycles = end - start;
-    unsigned long long insns  = N * INSNS_PER_ITER;
-
-    // IPC scaled by 1000
-    unsigned long long ipc_x1000 = (insns * 1000ULL) / cycles;
-
-    uart_puts("cycles=");
-    uart_putu(cycles);
-    uart_puts("\r\n");
-
-    uart_puts("insns=");
-    uart_putu(insns);
-    uart_puts("\r\n");
-
-    uart_puts("ipc=");
-    uart_put_fixed3(ipc_x1000);
-    uart_puts("\r\n");
+    uart_puts("done\r\n");
 
     return 0;
 }

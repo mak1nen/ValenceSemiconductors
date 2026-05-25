@@ -240,7 +240,7 @@ int main(int argc, char** argv) {
                         uint8_t  idex_rd  = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_rd;
                         bool     idex_jal = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_isJal;
                         bool     idex_jalr= dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_isJalr;
-                        uint64_t ex_res   = dut->rootp->SoC__DOT__core__DOT___execute_io_out_result;
+                        uint64_t ex_res = dut->rootp->SoC__DOT__core__DOT___memory_io_out_result;
                         uint64_t x1       = dut->rootp->SoC__DOT__core__DOT__regfile__DOT__regs_1;
 
                         if (idex_jal || idex_jalr || idex_rd == 1 || x1 == 9) {
