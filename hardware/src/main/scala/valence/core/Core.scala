@@ -51,22 +51,61 @@ class Core(p: CoreParams) extends Module {
   val mem_wb = Module(new PipelineReg(new MEMWBReg))
 
   // ---------------------------------------------------------------------------
-  // CSR read path
+  // CSR instruction support
   //
-  // This is enough for rdcycle:
-  //   rdcycle rd == csrrs rd, cycle, x0
+  // CSR funct3 encodings:
+  //   001 CSRRW
+  //   010 CSRRS
+  //   011 CSRRC
+  //   101 CSRRWI
+  //   110 CSRRSI
+  //   111 CSRRCI
   //
-  // Decode provides:
-  //   isCsr   = SYSTEM && funct3 != 000
-  //   csrAddr = instr[31:20]
-  //
-  // CSR writes are still disabled for now. This is read-only CSR plumbing.
+  // CSR instruction result to rd is always the old CSR value.
+  // CSRFile only sees final write data.
   // ---------------------------------------------------------------------------
+
   csr.io.addr := Mux(id_ex.io.out.isCsr, id_ex.io.out.csrAddr, 0.U(12.W))
+
+  val csrOld = csr.io.rdata
+
+  val csrUimmXlen = Cat(0.U((p.xlen - 5).W), id_ex.io.out.csrUimm)
+
+  val csrSrc = Mux(
+    id_ex.io.out.csrOp(2),
+    csrUimmXlen,
+    id_ex.io.out.rs1_val
+  )
+
+  val csrWriteData = MuxLookup(id_ex.io.out.csrOp, csrOld)(Seq(
+    "b001".U -> csrSrc,             // CSRRW
+    "b010".U -> (csrOld | csrSrc),  // CSRRS
+    "b011".U -> (csrOld & ~csrSrc), // CSRRC
+    "b101".U -> csrSrc,             // CSRRWI
+    "b110".U -> (csrOld | csrSrc),  // CSRRSI
+    "b111".U -> (csrOld & ~csrSrc)  // CSRRCI
+  ))
+
+  val csrIsWriteType =
+    id_ex.io.out.csrOp === "b001".U || // CSRRW
+    id_ex.io.out.csrOp === "b101".U    // CSRRWI
+
+  val csrIsSetClearType =
+    id_ex.io.out.csrOp === "b010".U || // CSRRS
+    id_ex.io.out.csrOp === "b011".U || // CSRRC
+    id_ex.io.out.csrOp === "b110".U || // CSRRSI
+    id_ex.io.out.csrOp === "b111".U    // CSRRCI
+
+  val csrSrcNonZero = csrSrc =/= 0.U
+
+  val csrWriteEnable =
+    id_ex.io.out.valid &&
+    id_ex.io.out.isCsr &&
+    (csrIsWriteType || (csrIsSetClearType && csrSrcNonZero))
 
   val exStageResult = Mux(
     id_ex.io.out.isCsr,
-    csr.io.rdata,
+    csrOld,
     execute.io.out.result
   )
 
@@ -171,6 +210,8 @@ class Core(p: CoreParams) extends Module {
   id_ex.io.in.brOp     := decode.io.out.brOp
   id_ex.io.in.memOp    := decode.io.out.memOp
   id_ex.io.in.csrAddr  := decode.io.out.csrAddr
+  id_ex.io.in.csrOp    := decode.io.out.csrOp
+  id_ex.io.in.csrUimm  := decode.io.out.csrUimm
   id_ex.io.in.useImm   := decode.io.out.useImm
   id_ex.io.in.isLoad   := decode.io.out.isLoad
   id_ex.io.in.isStore  := decode.io.out.isStore
@@ -197,7 +238,7 @@ class Core(p: CoreParams) extends Module {
   ex_mem.io.stall := mem_stall
   ex_mem.io.flush := false.B
 
-  // CSR read result is injected here for instructions like rdcycle.
+  // CSR read result is injected here. For CSR instructions, rd gets csrOld.
   ex_mem.io.in.result  := exStageResult
   ex_mem.io.in.rd      := Mux(id_ex.io.out.isCsr, id_ex.io.out.rd, execute.io.out.rd)
   ex_mem.io.in.rs2_val := execute.io.out.rs2_val
@@ -206,7 +247,7 @@ class Core(p: CoreParams) extends Module {
   ex_mem.io.in.isStore := execute.io.out.isStore && execute.io.out.valid
 
   // JAL/JALR produce a writeback result even though they redirect control flow.
-  // CSR reads also produce a writeback result.
+  // CSR instructions also produce a writeback result.
   ex_mem.io.in.valid :=
     execute.io.out.valid ||
     id_ex.io.out.isJal ||
@@ -248,19 +289,19 @@ class Core(p: CoreParams) extends Module {
   regfile.io.wdata := writeback.io.wdata
 
   // ---------------------------------------------------------------------------
-  // CSR + TrapUnit — Phase 0 stub plus counter support
+  // CSR + TrapUnit — Phase 0 stub plus CSR instruction support
   //
-  // CSR reads are partially integrated so rdcycle/cycle can work.
-  // CSR writes are still disabled for now.
+  // CSR instructions are now integrated enough for:
+  //   CSRRW/CSRRS/CSRRC/CSRRWI/CSRRSI/CSRRCI
   //
   // Trap handling is still not integrated into the pipeline.
   // ---------------------------------------------------------------------------
 
-  csr.io.wen       := false.B
-  csr.io.wdata     := 0.U(p.xlen.W)
+  csr.io.wen   := csrWriteEnable
+  csr.io.wdata := csrWriteData
 
   // Count retired instructions. This is approximate until precise commit/traps.
-  csr.io.retire    := mem_wb.io.out.valid
+  csr.io.retire := mem_wb.io.out.valid
 
   csr.io.takeTrap  := false.B
   csr.io.trapEpc   := 0.U(p.xlen.W)
@@ -308,7 +349,11 @@ class IDEXReg extends Bundle {
   val aluOp    = UInt(5.W)
   val brOp     = UInt(3.W)
   val memOp    = UInt(3.W)
+
   val csrAddr  = UInt(12.W)
+  val csrOp    = UInt(3.W)
+  val csrUimm  = UInt(5.W)
+
   val useImm   = Bool()
   val isLoad   = Bool()
   val isStore  = Bool()

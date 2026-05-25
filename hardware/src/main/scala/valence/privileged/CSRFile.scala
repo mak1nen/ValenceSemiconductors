@@ -25,7 +25,7 @@ object CSRFile {
   // mstatus bit positions (RV64)
   val MSTATUS_MIE_BIT  = 3
   val MSTATUS_MPIE_BIT = 7
-  // MPP is bits [12:11]; we always run in M-mode so MPP stays 11.
+  // MPP is bits [12:11]; for now this core only runs M-mode, so MPP is forced to 11.
   val MSTATUS_MPP_LSB  = 11
 
   // mie / mip bit positions
@@ -39,45 +39,62 @@ object CSRFile {
 }
 
 class CSRFile(xlen: Int) extends Module {
+  require(xlen == 64, "CSRFile currently assumes RV64")
+
   val io = IO(new Bundle {
-    // ----- Software CSR read/write port (driven by CSR instructions) -----
+    // ------------------------------------------------------------------------
+    // Software CSR read/write port.
+    //
+    // Core.scala computes the CSR instruction behavior:
+    //   CSRRW  -> wdata = rs1
+    //   CSRRS  -> wdata = old | rs1
+    //   CSRRC  -> wdata = old & ~rs1
+    //   CSRRWI -> wdata = uimm
+    //   CSRRSI -> wdata = old | uimm
+    //   CSRRCI -> wdata = old & ~uimm
+    //
+    // CSRFile only performs:
+    //   read:  rdata = CSR[addr]
+    //   write: if wen, CSR[addr] := wdata
+    // ------------------------------------------------------------------------
     val addr   = Input(UInt(12.W))
     val wen    = Input(Bool())
     val wdata  = Input(UInt(xlen.W))
     val rdata  = Output(UInt(xlen.W))
 
-    // ----- Retire pulse for minstret / instret -----
+    // Retire pulse for minstret / instret.
     // For now Core.scala can drive this with mem_wb.io.out.valid.
     // Later, once precise traps are finished, drive it from real commitValid.
     val retire = Input(Bool())
 
-    // ----- Trap entry interface (from TrapUnit) -----
-    // When takeTrap asserts, atomically:
+    // ------------------------------------------------------------------------
+    // Trap entry interface from TrapUnit.
+    //
+    // When takeTrap asserts:
     //   mepc   := trapEpc
     //   mcause := trapCause
     //   mtval  := trapTval
     //   mstatus.MPIE := mstatus.MIE
     //   mstatus.MIE  := 0
+    // ------------------------------------------------------------------------
     val takeTrap  = Input(Bool())
     val trapEpc   = Input(UInt(xlen.W))
     val trapCause = Input(UInt(xlen.W))
     val trapTval  = Input(UInt(xlen.W))
 
-    // ----- MRET interface (from TrapUnit) -----
-    // When takeMret asserts, atomically:
+    // MRET interface from TrapUnit.
+    //
+    // When takeMret asserts:
     //   mstatus.MIE  := mstatus.MPIE
     //   mstatus.MPIE := 1
     val takeMret = Input(Bool())
 
-    // ----- Hardware interrupt line inputs (from CLINT/PLIC) -----
-    // These set the corresponding bits in mip (which is read-only for
-    // these bits — software can't clear a real pending line, the source
-    // device must).
-    val mtipIn = Input(Bool())  // timer interrupt pending (from CLINT)
-    val msipIn = Input(Bool())  // software interrupt pending (from CLINT)
-    val meipIn = Input(Bool())  // external interrupt pending (from PLIC)
+    // Hardware interrupt line inputs.
+    val mtipIn = Input(Bool())  // machine timer interrupt pending
+    val msipIn = Input(Bool())  // machine software interrupt pending
+    val meipIn = Input(Bool())  // machine external interrupt pending
 
-    // ----- CSR value exports (read by TrapUnit and other modules) -----
+    // CSR value exports for TrapUnit / other modules.
     val mstatus = Output(UInt(xlen.W))
     val mie     = Output(UInt(xlen.W))
     val mip     = Output(UInt(xlen.W))
@@ -90,13 +107,17 @@ class CSRFile(xlen: Int) extends Module {
   // --------------------------------------------------------------------------
 
   val mstatusReg = RegInit(0.U(xlen.W))
-  val misa       = RegInit(0.U(xlen.W))  // TODO: populate with supported extensions
-  val mieReg     = RegInit(0.U(xlen.W))
-  val mtvec      = RegInit(0.U(xlen.W))
-  val mscratch   = RegInit(0.U(xlen.W))
-  val mepc       = RegInit(0.U(xlen.W))
-  val mcause     = RegInit(0.U(xlen.W))
-  val mtval      = RegInit(0.U(xlen.W))
+
+  // TODO: later populate MISA with RV64 + supported extension bits.
+  // For now keep read-only zero.
+  val misa = RegInit(0.U(xlen.W))
+
+  val mieReg   = RegInit(0.U(xlen.W))
+  val mtvec    = RegInit(0.U(xlen.W))
+  val mscratch = RegInit(0.U(xlen.W))
+  val mepc     = RegInit(0.U(xlen.W))
+  val mcause   = RegInit(0.U(xlen.W))
+  val mtval    = RegInit(0.U(xlen.W))
 
   // --------------------------------------------------------------------------
   // Counter CSRs
@@ -120,12 +141,13 @@ class CSRFile(xlen: Int) extends Module {
   // --------------------------------------------------------------------------
   // mip register
   //
-  // Hardware-driven bits (MTIP, MSIP, MEIP) come from the interrupt source
-  // devices and are read-only from the software side for our implementation.
-  // Software-writable mip bits don't exist in this minimal core.
+  // In this minimal core, real interrupt-pending bits are hardware driven.
+  // Software writes to mip are ignored.
   // --------------------------------------------------------------------------
 
   val mip = Wire(UInt(xlen.W))
+  mip := 0.U
+
   mip := Cat(
     0.U((xlen - 12).W),
     io.meipIn,                // bit 11
@@ -137,19 +159,12 @@ class CSRFile(xlen: Int) extends Module {
   )
 
   // --------------------------------------------------------------------------
-  // mstatus state machine
-  //
-  // Priority for mstatus update this cycle:
-  //   1. takeTrap   -> save MIE to MPIE, clear MIE
-  //   2. takeMret   -> restore MIE from MPIE, set MPIE = 1
-  //   3. software CSR write to mstatus (only if no trap/mret this cycle)
+  // mstatus helpers
   // --------------------------------------------------------------------------
 
   val mstatusMie  = mstatusReg(CSRFile.MSTATUS_MIE_BIT)
   val mstatusMpie = mstatusReg(CSRFile.MSTATUS_MPIE_BIT)
 
-  // Helper: build new mstatus with MIE, MPIE, and MPP updated.
-  // MPP is always forced to 11 (M-mode) since this core only implements M-mode.
   def mstatusWithMieMpieMpp(current: UInt, newMie: Bool, newMpie: Bool): UInt = {
     val mieMask  = (BigInt(1) << CSRFile.MSTATUS_MIE_BIT).U(xlen.W)
     val mpieMask = (BigInt(1) << CSRFile.MSTATUS_MPIE_BIT).U(xlen.W)
@@ -164,22 +179,45 @@ class CSRFile(xlen: Int) extends Module {
       mppM
   }
 
-  val softwareWritesMstatus = io.wen && (io.addr === CSRFile.MSTATUS.U)
+  // For now preserve user-provided mstatus bits but force MPP=M.
+  def normalizeMstatus(x: UInt): UInt = {
+    val mppMask = (BigInt(3) << CSRFile.MSTATUS_MPP_LSB).U(xlen.W)
+    val mppM    = (BigInt(3) << CSRFile.MSTATUS_MPP_LSB).U(xlen.W)
+
+    (x & ~mppMask) | mppM
+  }
+
+  // --------------------------------------------------------------------------
+  // mstatus update priority
+  //
+  // Priority:
+  //   1. Trap entry
+  //   2. MRET
+  //   3. Software CSR write
+  // --------------------------------------------------------------------------
+
+  val softwareCanWrite = io.wen && !io.takeTrap && !io.takeMret
 
   when (io.takeTrap) {
-    // Save MIE -> MPIE, clear MIE, force MPP = M
-    mstatusReg := mstatusWithMieMpieMpp(mstatusReg, newMie = false.B, newMpie = mstatusMie)
+    // Save MIE -> MPIE, clear MIE, force MPP = M.
+    mstatusReg := mstatusWithMieMpieMpp(
+      mstatusReg,
+      newMie  = false.B,
+      newMpie = mstatusMie
+    )
   } .elsewhen (io.takeMret) {
-    // Restore MIE from MPIE, set MPIE = 1, force MPP = M
-    mstatusReg := mstatusWithMieMpieMpp(mstatusReg, newMie = mstatusMpie, newMpie = true.B)
-  } .elsewhen (softwareWritesMstatus) {
-    mstatusReg := io.wdata
+    // Restore MIE from MPIE, set MPIE = 1, force MPP = M.
+    mstatusReg := mstatusWithMieMpieMpp(
+      mstatusReg,
+      newMie  = mstatusMpie,
+      newMpie = true.B
+    )
+  } .elsewhen (softwareCanWrite && io.addr === CSRFile.MSTATUS.U) {
+    mstatusReg := normalizeMstatus(io.wdata)
   }
 
   // --------------------------------------------------------------------------
   // Trap entry writes to mepc / mcause / mtval
-  //
-  // These happen atomically with mstatus update on takeTrap.
   // --------------------------------------------------------------------------
 
   when (io.takeTrap) {
@@ -191,13 +229,9 @@ class CSRFile(xlen: Int) extends Module {
   // --------------------------------------------------------------------------
   // Software CSR writes
   //
-  // Only effective when no trap/mret this cycle.
-  //
-  // Counter writes are allowed for machine-mode software/debug. For your
-  // current rdcycle benchmark, only reads are needed, but writes are harmless.
+  // Core.scala computes the final CSR write value.
+  // CSRFile just stores io.wdata into the selected CSR.
   // --------------------------------------------------------------------------
-
-  val softwareCanWrite = io.wen && !io.takeTrap && !io.takeMret
 
   when (softwareCanWrite) {
     switch(io.addr) {
@@ -208,15 +242,15 @@ class CSRFile(xlen: Int) extends Module {
       is(CSRFile.MCAUSE.U)   { mcause   := io.wdata }
       is(CSRFile.MTVAL.U)    { mtval    := io.wdata }
 
+      // Machine counter CSRs are writable in this minimal M-mode implementation.
       is(CSRFile.MCYCLE.U)   { mcycle   := io.wdata }
       is(CSRFile.MINSTRET.U) { minstret := io.wdata }
 
-      // mstatus handled above
-      // mip: software writes to mip in this core are ignored
-      //      (hardware-only pending bits)
-      // misa: read-only in this core
-      // mhartid: read-only
-      // cycle/instret aliases are read-only aliases here
+      // mstatus handled above.
+      // misa is read-only for now.
+      // mip is hardware driven for implemented interrupt pending bits.
+      // mhartid is read-only.
+      // cycle/instret are read-only aliases here.
     }
   }
 
@@ -224,7 +258,7 @@ class CSRFile(xlen: Int) extends Module {
   // Read port
   // --------------------------------------------------------------------------
 
-  io.rdata := MuxLookup(io.addr, 0.U)(Seq(
+  io.rdata := MuxLookup(io.addr, 0.U(xlen.W))(Seq(
     CSRFile.MSTATUS.U  -> mstatusReg,
     CSRFile.MISA.U     -> misa,
     CSRFile.MIE.U      -> mieReg,
@@ -234,7 +268,7 @@ class CSRFile(xlen: Int) extends Module {
     CSRFile.MCAUSE.U   -> mcause,
     CSRFile.MTVAL.U    -> mtval,
     CSRFile.MIP.U      -> mip,
-    CSRFile.MHARTID.U  -> 0.U,
+    CSRFile.MHARTID.U  -> 0.U(xlen.W),
 
     CSRFile.MCYCLE.U   -> mcycle,
     CSRFile.CYCLE.U    -> mcycle,

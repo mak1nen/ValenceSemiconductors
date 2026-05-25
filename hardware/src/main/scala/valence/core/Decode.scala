@@ -30,7 +30,11 @@ class DecodeOut extends Bundle {
   val mulDivOp = UInt(5.W)
   val brOp     = UInt(3.W)
   val memOp    = UInt(3.W)
+
+  // CSR instruction fields
   val csrAddr  = UInt(12.W)
+  val csrOp    = UInt(3.W)
+  val csrUimm  = UInt(5.W)
 
   val isLoad   = Bool()
   val isStore  = Bool()
@@ -99,7 +103,11 @@ class Decode extends Module {
   out.rs2      := rs2
   out.rd       := Mux(writesRd, rd, 0.U)
   out.memOp    := funct3
+
+  // CSR metadata
   out.csrAddr  := instr(31, 20)
+  out.csrOp    := funct3
+  out.csrUimm  := rs1
 
   out.isLoad   := opcode === Opcode.LOAD
   out.isStore  := opcode === Opcode.STORE

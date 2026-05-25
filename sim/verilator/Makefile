@@ -3,7 +3,7 @@ RTL_DIR  = ../../hardware/generated
 SW_DIR   = ../sw
 CC       = riscv64-unknown-elf-gcc
 OBJCOPY  = riscv64-unknown-elf-objcopy
-CFLAGS   = -march=rv64im -mabi=lp64 -nostdlib -O2
+CFLAGS   = -march=rv64im_zicsr_zicntr -mabi=lp64 -nostdlib -O2
 
 VERILATOR_FLAGS = --cc --exe --build \
     --top-module $(TOP) \
