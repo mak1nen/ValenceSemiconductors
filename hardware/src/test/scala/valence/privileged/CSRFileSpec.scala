@@ -17,9 +17,15 @@ class CSRFileSpec extends AnyFlatSpec with Matchers {
       dut.io.wen.poke(false)
       dut.io.addr.poke(0.U)
       dut.io.wdata.poke(0.U)
-      dut.io.exception.poke(false)
-      dut.io.epc.poke(0.U)
-      dut.io.cause.poke(0.U)
+      dut.io.takeTrap.poke(false)
+      dut.io.trapEpc.poke(0.U)
+      dut.io.trapCause.poke(0.U)
+      dut.io.trapTval.poke(0.U)
+      dut.io.takeMret.poke(false)
+      dut.io.mtipIn.poke(false)
+      dut.io.msipIn.poke(false)
+      dut.io.meipIn.poke(false)
+      dut.io.retire.poke(false)
       fn(dut)
     }
 
@@ -59,7 +65,7 @@ class CSRFileSpec extends AnyFlatSpec with Matchers {
     }
   }
 
-  it should "save epc and cause on exception" in {
+  it should "save epc and cause on trap" in {
     test { dut =>
       // set mtvec first
       dut.io.wen.poke(true)
@@ -68,12 +74,13 @@ class CSRFileSpec extends AnyFlatSpec with Matchers {
       dut.clock.step()
       dut.io.wen.poke(false)
 
-      // trigger exception
-      dut.io.exception.poke(true)
-      dut.io.epc.poke(0x80001000L.U)
-      dut.io.cause.poke(11.U)
+      // trigger trap
+      dut.io.takeTrap.poke(true)
+      dut.io.trapEpc.poke(0x80001000L.U)
+      dut.io.trapCause.poke(11.U)
+      dut.io.trapTval.poke(0.U)
       dut.clock.step()
-      dut.io.exception.poke(false)
+      dut.io.takeTrap.poke(false)
 
       // mepc should hold the faulting pc
       dut.io.addr.poke(CSRFile.MEPC.U)
@@ -83,8 +90,8 @@ class CSRFileSpec extends AnyFlatSpec with Matchers {
       dut.io.addr.poke(CSRFile.MCAUSE.U)
       dut.io.rdata.expect(11.U)
 
-      // trap vector output
-      dut.io.tvec.expect(0x80000000L.U)
+      // mtvec export
+      dut.io.mtvec.expect(0x80000000L.U)
     }
   }
 

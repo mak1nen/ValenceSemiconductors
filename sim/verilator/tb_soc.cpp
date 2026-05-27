@@ -200,25 +200,77 @@ int main(int argc, char** argv) {
         dut->eval();
 
         bool tx_valid = dut->rootp->SoC__DOT____Vcellinp__uart__io_tx_valid;
-        uint8_t tx_data = dut->rootp->SoC__DOT____Vcellinp__uart__io_tx_data;
+        uint8_t tx_data = dut->rootp->SoC__DOT__uart__DOT__shift_reg;
         uint8_t uart_state = dut->rootp->SoC__DOT__uart__DOT__state;
 
         if (tx_valid && uart_state == 0) {
-            uint64_t core_wdata = dut->rootp->SoC__DOT___core_io_dcache_wdata;
             uint64_t a0 = dut->rootp->SoC__DOT__core__DOT__regfile__DOT__regs_10;
             uint64_t a4 = dut->rootp->SoC__DOT__core__DOT__regfile__DOT__regs_14;
             uint64_t a5 = dut->rootp->SoC__DOT__core__DOT__regfile__DOT__regs_15;
 
-            printf("[uart-accept] cycle=%llu tx=0x%02x '%c' core_wdata=0x%016llx a0=0x%016llx a4=0x%016llx a5=0x%016llx\n",
+            printf("[uart-accept] cycle=%llu tx=0x%02x \'%c\' a0=0x%016llx a4=0x%016llx a5=0x%016llx\n",
                    (unsigned long long)cycle,
                    tx_data,
                    (tx_data >= 32 && tx_data <= 126) ? tx_data : '.',
-                   (unsigned long long)core_wdata,
                    (unsigned long long)a0,
                    (unsigned long long)a4,
                    (unsigned long long)a5);
         }
 
+        // Atomic debug
+        {
+            bool idex_isLR  = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_isLR;
+            bool idex_isSC  = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_isSC;
+            bool exmem_isLR = dut->rootp->SoC__DOT__core__DOT__ex_mem__DOT__reg_isLR;
+            bool exmem_isSC = dut->rootp->SoC__DOT__core__DOT__ex_mem__DOT__reg_isSC;
+
+            if (idex_isLR || idex_isSC || exmem_isLR || exmem_isSC) {
+                bool resv         = dut->rootp->SoC__DOT__core__DOT__memory__DOT__reservationValid;
+                uint64_t res_addr = dut->rootp->SoC__DOT__core__DOT__memory__DOT__reservationAddr;
+                uint64_t ex_addr  = dut->rootp->SoC__DOT__core__DOT__ex_mem__DOT__reg_result;
+                uint64_t ex_rs2   = dut->rootp->SoC__DOT__core__DOT__ex_mem__DOT__reg_rs2_val;
+                bool dcache_wen   = dut->rootp->SoC__DOT___core_io_dcache_wen;
+
+                printf("[ATOMIC] cycle=%llu idexLR=%d idexSC=%d exmemLR=%d exmemSC=%d resv=%d res_addr=0x%016llx ex_addr=0x%016llx rs2=0x%016llx dwen=%d\n",
+                       (unsigned long long)cycle,
+                       idex_isLR,
+                       idex_isSC,
+                       exmem_isLR,
+                       exmem_isSC,
+                       resv,
+                       (unsigned long long)res_addr,
+                       (unsigned long long)ex_addr,
+                       (unsigned long long)ex_rs2,
+                       dcache_wen);
+            }
+
+            // When LR or SC is in ID/EX, dump its decoded inputs.
+            // This is where we catch a bad immediate, wrong rs1, or wrong amoOp.
+            if (idex_isLR || idex_isSC) {
+                uint64_t idex_pc      = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_pc;
+                uint64_t idex_rs1_val = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_rs1_val;
+                uint64_t idex_rs2_val = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_rs2_val;
+                uint64_t idex_imm     = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_imm;
+                uint8_t  idex_aluOp   = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_aluOp;
+                uint8_t  idex_amoOp   = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_amoOp;
+                bool     idex_useImm  = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_useImm;
+                uint8_t  idex_rd      = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_rd;
+
+                printf("[%s-idex] cycle=%llu pc=0x%08llx rd=x%u rs1=0x%016llx rs2=0x%016llx imm=0x%016llx useImm=%d aluOp=%u amoOp=%u\n",
+                       idex_isLR ? "LR" : "SC",
+                       (unsigned long long)cycle,
+                       (unsigned long long)idex_pc,
+                       idex_rd,
+                       (unsigned long long)idex_rs1_val,
+                       (unsigned long long)idex_rs2_val,
+                       (unsigned long long)idex_imm,
+                       idex_useImm,
+                       idex_aluOp,
+                       idex_amoOp);
+            }
+        }
+
+        // UART decode + DONE detection
         int ch = uart.tick(dut->io_uart_tx);
         if (ch >= 0) {
             putchar(ch);
@@ -235,25 +287,23 @@ int main(int argc, char** argv) {
         }
 
         if (cycle < 120) {
+            uint64_t idex_pc  = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_pc;
+            uint8_t  idex_rd  = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_rd;
+            bool     idex_jal = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_isJal;
+            bool     idex_jalr= dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_isJalr;
+            uint64_t ex_res   = dut->rootp->SoC__DOT__core__DOT___memory_io_out_result;
+            uint64_t x1       = dut->rootp->SoC__DOT__core__DOT__regfile__DOT__regs_1;
 
-                        uint64_t idex_pc  = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_pc;
-                        uint8_t  idex_rd  = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_rd;
-                        bool     idex_jal = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_isJal;
-                        bool     idex_jalr= dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_isJalr;
-                        uint64_t ex_res = dut->rootp->SoC__DOT__core__DOT___memory_io_out_result;
-                        uint64_t x1       = dut->rootp->SoC__DOT__core__DOT__regfile__DOT__regs_1;
-
-                        if (idex_jal || idex_jalr || idex_rd == 1 || x1 == 9) {
-                            printf("[ra-debug] cycle=%llu idex_pc=0x%08llx rd=x%u jal=%d jalr=%d ex_res=0x%016llx x1=0x%016llx\n",
-                                (unsigned long long)cycle,
-                                (unsigned long long)idex_pc,
-                                idex_rd,
-                                idex_jal,
-                                idex_jalr,
-                                (unsigned long long)ex_res,
-                                (unsigned long long)x1);
-                            }
-
+            if (idex_jal || idex_jalr || idex_rd == 1 || x1 == 9) {
+                printf("[ra-debug] cycle=%llu idex_pc=0x%08llx rd=x%u jal=%d jalr=%d ex_res=0x%016llx x1=0x%016llx\n",
+                    (unsigned long long)cycle,
+                    (unsigned long long)idex_pc,
+                    idex_rd,
+                    idex_jal,
+                    idex_jalr,
+                    (unsigned long long)ex_res,
+                    (unsigned long long)x1);
+            }
 
             printf(
                 "[sim] cycle %llu  frontend_pc=0x%08llx  if_id_pc=0x%08llx  if_id_instr=0x%08x  x1=0x%016llx  x5=0x%016llx  x6=0x%016llx\n",

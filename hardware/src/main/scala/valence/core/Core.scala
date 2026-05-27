@@ -8,6 +8,7 @@ import valence.params.CoreParams
 
 class Core(p: CoreParams) extends Module {
   val io = IO(new Bundle {
+
     // ICache
     val icache_addr  = Output(UInt(64.W))
     val icache_req   = Output(Bool())
@@ -31,20 +32,24 @@ class Core(p: CoreParams) extends Module {
   // ---------------------------------------------------------------------------
   // Pipeline stages
   // ---------------------------------------------------------------------------
+
   val frontend  = Module(new Frontend)
   val decode    = Module(new Decode)
   val regfile   = Module(new RegFile(p.xlen))
   val execute   = Module(new Execute)
   val memory    = Module(new Memory)
   val writeback = Module(new Writeback)
+
   val hazard    = Module(new HazardUnit)
   val forward   = Module(new ForwardingUnit)
+
   val csr       = Module(new CSRFile(p.xlen))
   val trap      = Module(new TrapUnit(p.xlen))
 
   // ---------------------------------------------------------------------------
   // Pipeline registers
   // ---------------------------------------------------------------------------
+
   val if_id  = Module(new PipelineReg(new IFIDReg))
   val id_ex  = Module(new PipelineReg(new IDEXReg))
   val ex_mem = Module(new PipelineReg(new EXMEMReg))
@@ -52,24 +57,18 @@ class Core(p: CoreParams) extends Module {
 
   // ---------------------------------------------------------------------------
   // CSR instruction support
-  //
-  // CSR funct3 encodings:
-  //   001 CSRRW
-  //   010 CSRRS
-  //   011 CSRRC
-  //   101 CSRRWI
-  //   110 CSRRSI
-  //   111 CSRRCI
-  //
-  // CSR instruction result to rd is always the old CSR value.
-  // CSRFile only sees final write data.
   // ---------------------------------------------------------------------------
 
-  csr.io.addr := Mux(id_ex.io.out.isCsr, id_ex.io.out.csrAddr, 0.U(12.W))
+  csr.io.addr := Mux(
+    id_ex.io.out.isCsr,
+    id_ex.io.out.csrAddr,
+    0.U(12.W)
+  )
 
   val csrOld = csr.io.rdata
 
-  val csrUimmXlen = Cat(0.U((p.xlen - 5).W), id_ex.io.out.csrUimm)
+  val csrUimmXlen =
+    Cat(0.U((p.xlen - 5).W), id_ex.io.out.csrUimm)
 
   val csrSrc = Mux(
     id_ex.io.out.csrOp(2),
@@ -77,31 +76,36 @@ class Core(p: CoreParams) extends Module {
     id_ex.io.out.rs1_val
   )
 
-  val csrWriteData = MuxLookup(id_ex.io.out.csrOp, csrOld)(Seq(
-    "b001".U -> csrSrc,             // CSRRW
-    "b010".U -> (csrOld | csrSrc),  // CSRRS
-    "b011".U -> (csrOld & ~csrSrc), // CSRRC
-    "b101".U -> csrSrc,             // CSRRWI
-    "b110".U -> (csrOld | csrSrc),  // CSRRSI
-    "b111".U -> (csrOld & ~csrSrc)  // CSRRCI
+  val csrWriteData = MuxLookup(
+    id_ex.io.out.csrOp,
+    csrOld
+  )(Seq(
+    "b001".U -> csrSrc,
+    "b010".U -> (csrOld | csrSrc),
+    "b011".U -> (csrOld & ~csrSrc),
+    "b101".U -> csrSrc,
+    "b110".U -> (csrOld | csrSrc),
+    "b111".U -> (csrOld & ~csrSrc)
   ))
 
   val csrIsWriteType =
-    id_ex.io.out.csrOp === "b001".U || // CSRRW
-    id_ex.io.out.csrOp === "b101".U    // CSRRWI
+    id_ex.io.out.csrOp === "b001".U ||
+    id_ex.io.out.csrOp === "b101".U
 
   val csrIsSetClearType =
-    id_ex.io.out.csrOp === "b010".U || // CSRRS
-    id_ex.io.out.csrOp === "b011".U || // CSRRC
-    id_ex.io.out.csrOp === "b110".U || // CSRRSI
-    id_ex.io.out.csrOp === "b111".U    // CSRRCI
+    id_ex.io.out.csrOp === "b010".U ||
+    id_ex.io.out.csrOp === "b011".U ||
+    id_ex.io.out.csrOp === "b110".U ||
+    id_ex.io.out.csrOp === "b111".U
 
-  val csrSrcNonZero = csrSrc =/= 0.U
+  val csrSrcNonZero =
+    csrSrc =/= 0.U
 
   val csrWriteEnable =
     id_ex.io.out.valid &&
     id_ex.io.out.isCsr &&
-    (csrIsWriteType || (csrIsSetClearType && csrSrcNonZero))
+    (csrIsWriteType ||
+    (csrIsSetClearType && csrSrcNonZero))
 
   val exStageResult = Mux(
     id_ex.io.out.isCsr,
@@ -112,6 +116,7 @@ class Core(p: CoreParams) extends Module {
   // ---------------------------------------------------------------------------
   // Hazard control
   // ---------------------------------------------------------------------------
+
   hazard.io.id_rs1 := decode.io.out.rs1
   hazard.io.id_rs2 := decode.io.out.rs2
 
@@ -124,17 +129,21 @@ class Core(p: CoreParams) extends Module {
 
   hazard.io.branch_taken := execute.io.out.branch_taken
 
-  // Memory-stage backpressure.
-  //
-  // This is asserted by SoC.scala when, for example, software writes UART while
-  // the UART transmitter is busy. The pending memory operation must remain held
-  // in EX/MEM until the memory/peripheral accepts it.
-  val mem_stall  = io.dcache_stall
-  val pipe_stall = hazard.io.stall || mem_stall
+  val mem_stall = io.dcache_stall
+
+  // Atomic serialization — hold IF/ID while atomic is in EX or MEM stage.
+  // The atomic itself flows forward freely; only new instructions are blocked.
+  val atomic_in_flight =
+    id_ex.io.out.isLR || id_ex.io.out.isSC || id_ex.io.out.isAmo
+
+  val pipe_stall =
+    hazard.io.stall ||
+    mem_stall
 
   // ---------------------------------------------------------------------------
   // Frontend
   // ---------------------------------------------------------------------------
+
   frontend.io.stall        := pipe_stall
   frontend.io.flush        := hazard.io.flush
   frontend.io.redirect     := execute.io.out.branch_taken
@@ -148,8 +157,10 @@ class Core(p: CoreParams) extends Module {
   // ---------------------------------------------------------------------------
   // IF/ID register
   // ---------------------------------------------------------------------------
+
   if_id.io.stall    := pipe_stall
   if_id.io.flush    := hazard.io.flush
+
   if_id.io.in.pc    := frontend.io.out_pc
   if_id.io.in.instr := frontend.io.out_instr
   if_id.io.in.valid := frontend.io.out_valid
@@ -157,22 +168,27 @@ class Core(p: CoreParams) extends Module {
   // ---------------------------------------------------------------------------
   // Decode
   // ---------------------------------------------------------------------------
+
   decode.io.instr := if_id.io.out.instr
 
   // ---------------------------------------------------------------------------
   // Register file read
   // ---------------------------------------------------------------------------
+
   regfile.io.raddr1 := decode.io.out.rs1
   regfile.io.raddr2 := decode.io.out.rs2
 
   // ---------------------------------------------------------------------------
   // Forwarding
   // ---------------------------------------------------------------------------
+
   forward.io.ex_rs1 := decode.io.out.rs1
   forward.io.ex_rs2 := decode.io.out.rs2
 
   forward.io.ex_rd  := id_ex.io.out.rd
-  forward.io.ex_wen := id_ex.io.out.valid || id_ex.io.out.isJal || id_ex.io.out.isJalr
+  forward.io.ex_wen := id_ex.io.out.valid ||
+                       id_ex.io.out.isJal ||
+                       id_ex.io.out.isJalr
 
   forward.io.mem_rd  := ex_mem.io.out.rd
   forward.io.mem_wen := ex_mem.io.out.valid
@@ -180,13 +196,19 @@ class Core(p: CoreParams) extends Module {
   forward.io.wb_rd  := mem_wb.io.out.rd
   forward.io.wb_wen := mem_wb.io.out.valid
 
-  val fwd_rs1 = MuxLookup(forward.io.fwd_a, regfile.io.rdata1)(Seq(
+  val fwd_rs1 = MuxLookup(
+    forward.io.fwd_a,
+    regfile.io.rdata1
+  )(Seq(
     ForwardingUnit.FWD_EX.U  -> exStageResult,
     ForwardingUnit.FWD_MEM.U -> memory.io.out.result,
     ForwardingUnit.FWD_WB.U  -> mem_wb.io.out.result
   ))
 
-  val fwd_rs2 = MuxLookup(forward.io.fwd_b, regfile.io.rdata2)(Seq(
+  val fwd_rs2 = MuxLookup(
+    forward.io.fwd_b,
+    regfile.io.rdata2
+  )(Seq(
     ForwardingUnit.FWD_EX.U  -> exStageResult,
     ForwardingUnit.FWD_MEM.U -> memory.io.out.result,
     ForwardingUnit.FWD_WB.U  -> mem_wb.io.out.result
@@ -194,10 +216,8 @@ class Core(p: CoreParams) extends Module {
 
   // ---------------------------------------------------------------------------
   // ID/EX register
-  //
-  // On normal load-use hazard, insert a bubble.
-  // On memory/peripheral stall, hold ID/EX so decode/execute do not run ahead.
   // ---------------------------------------------------------------------------
+
   id_ex.io.stall := mem_stall
   id_ex.io.flush := hazard.io.stall || hazard.io.flush
 
@@ -207,11 +227,18 @@ class Core(p: CoreParams) extends Module {
   id_ex.io.in.imm      := decode.io.out.imm
   id_ex.io.in.rd       := decode.io.out.rd
   id_ex.io.in.aluOp    := decode.io.out.aluOp
+  id_ex.io.in.mulDivOp := decode.io.out.mulDivOp
   id_ex.io.in.brOp     := decode.io.out.brOp
   id_ex.io.in.memOp    := decode.io.out.memOp
   id_ex.io.in.csrAddr  := decode.io.out.csrAddr
   id_ex.io.in.csrOp    := decode.io.out.csrOp
   id_ex.io.in.csrUimm  := decode.io.out.csrUimm
+  id_ex.io.in.isLR     := decode.io.out.isLR
+  id_ex.io.in.isSC     := decode.io.out.isSC
+  id_ex.io.in.isAmo    := decode.io.out.isAmo
+  id_ex.io.in.amoOp    := decode.io.out.amoOp
+  id_ex.io.in.aq       := decode.io.out.aq
+  id_ex.io.in.rl       := decode.io.out.rl
   id_ex.io.in.useImm   := decode.io.out.useImm
   id_ex.io.in.isLoad   := decode.io.out.isLoad
   id_ex.io.in.isStore  := decode.io.out.isStore
@@ -221,43 +248,57 @@ class Core(p: CoreParams) extends Module {
   id_ex.io.in.isLui    := decode.io.out.isLui
   id_ex.io.in.isAuipc  := decode.io.out.isAuipc
   id_ex.io.in.isCsr    := decode.io.out.isCsr
+  id_ex.io.in.isMulDiv := decode.io.out.isMulDiv
   id_ex.io.in.valid    := if_id.io.out.valid && !hazard.io.stall
 
   // ---------------------------------------------------------------------------
   // Execute
   // ---------------------------------------------------------------------------
+
   execute.io.in := id_ex.io.out
 
   // ---------------------------------------------------------------------------
   // EX/MEM register
-  //
-  // This is the critical fix for UART backpressure:
-  // when dcache_stall is high, hold the memory-stage operation in EX/MEM.
-  // Otherwise the UART store disappears before uart.tx_ready comes back.
   // ---------------------------------------------------------------------------
+
   ex_mem.io.stall := mem_stall
   ex_mem.io.flush := false.B
 
-  // CSR read result is injected here. For CSR instructions, rd gets csrOld.
   ex_mem.io.in.result  := exStageResult
   ex_mem.io.in.rd      := Mux(id_ex.io.out.isCsr, id_ex.io.out.rd, execute.io.out.rd)
   ex_mem.io.in.rs2_val := execute.io.out.rs2_val
   ex_mem.io.in.memOp   := execute.io.out.memOp
   ex_mem.io.in.isLoad  := execute.io.out.isLoad
   ex_mem.io.in.isStore := execute.io.out.isStore && execute.io.out.valid
-
-  // JAL/JALR produce a writeback result even though they redirect control flow.
-  // CSR instructions also produce a writeback result.
-  ex_mem.io.in.valid :=
-    execute.io.out.valid ||
-    id_ex.io.out.isJal ||
-    id_ex.io.out.isJalr ||
-    (id_ex.io.out.isCsr && id_ex.io.out.valid)
+  ex_mem.io.in.isLR    := execute.io.out.isLR
+  ex_mem.io.in.isSC    := execute.io.out.isSC
+  ex_mem.io.in.isAmo   := execute.io.out.isAmo
+  ex_mem.io.in.amoOp   := execute.io.out.amoOp
+  ex_mem.io.in.valid   :=
+    execute.io.out.valid   ||
+    id_ex.io.out.isJal     ||
+    id_ex.io.out.isJalr    ||
+    (id_ex.io.out.isCsr && id_ex.io.out.valid) ||
+    id_ex.io.out.isLR      ||
+    id_ex.io.out.isSC      ||
+    id_ex.io.out.isAmo
 
   // ---------------------------------------------------------------------------
   // Memory
   // ---------------------------------------------------------------------------
-  memory.io.in           := ex_mem.io.out
+
+  memory.io.in.result  := ex_mem.io.out.result
+  memory.io.in.rd      := ex_mem.io.out.rd
+  memory.io.in.rs2_val := ex_mem.io.out.rs2_val
+  memory.io.in.memOp   := ex_mem.io.out.memOp
+  memory.io.in.isLoad  := ex_mem.io.out.isLoad
+  memory.io.in.isStore := ex_mem.io.out.isStore
+  memory.io.in.isLR    := ex_mem.io.out.isLR
+  memory.io.in.isSC    := ex_mem.io.out.isSC
+  memory.io.in.isAmo   := ex_mem.io.out.isAmo
+  memory.io.in.amoOp   := ex_mem.io.out.amoOp
+  memory.io.in.valid   := ex_mem.io.out.valid
+
   memory.io.dcache_rdata := io.dcache_rdata
   memory.io.dcache_stall := io.dcache_stall
 
@@ -269,10 +310,8 @@ class Core(p: CoreParams) extends Module {
 
   // ---------------------------------------------------------------------------
   // MEM/WB register
-  //
-  // Let writeback drain even while the memory stage is stalled.
-  // memory.io.out.valid is already suppressed during dcache_stall.
   // ---------------------------------------------------------------------------
+
   mem_wb.io.stall     := false.B
   mem_wb.io.flush     := false.B
   mem_wb.io.in.result := memory.io.out.result
@@ -282,6 +321,7 @@ class Core(p: CoreParams) extends Module {
   // ---------------------------------------------------------------------------
   // Writeback
   // ---------------------------------------------------------------------------
+
   writeback.io.in := mem_wb.io.out
 
   regfile.io.wen   := writeback.io.wen
@@ -289,18 +329,11 @@ class Core(p: CoreParams) extends Module {
   regfile.io.wdata := writeback.io.wdata
 
   // ---------------------------------------------------------------------------
-  // CSR + TrapUnit — Phase 0 stub plus CSR instruction support
-  //
-  // CSR instructions are now integrated enough for:
-  //   CSRRW/CSRRS/CSRRC/CSRRWI/CSRRSI/CSRRCI
-  //
-  // Trap handling is still not integrated into the pipeline.
+  // CSR + TrapUnit
   // ---------------------------------------------------------------------------
 
   csr.io.wen   := csrWriteEnable
   csr.io.wdata := csrWriteData
-
-  // Count retired instructions. This is approximate until precise commit/traps.
   csr.io.retire := mem_wb.io.out.valid
 
   csr.io.takeTrap  := false.B
@@ -334,6 +367,7 @@ class Core(p: CoreParams) extends Module {
 // -----------------------------------------------------------------------------
 // Pipeline register data types
 // -----------------------------------------------------------------------------
+
 class IFIDReg extends Bundle {
   val pc    = UInt(64.W)
   val instr = UInt(32.W)
@@ -347,13 +381,18 @@ class IDEXReg extends Bundle {
   val imm      = UInt(64.W)
   val rd       = UInt(5.W)
   val aluOp    = UInt(5.W)
+  val mulDivOp = UInt(5.W)
   val brOp     = UInt(3.W)
   val memOp    = UInt(3.W)
-
   val csrAddr  = UInt(12.W)
   val csrOp    = UInt(3.W)
   val csrUimm  = UInt(5.W)
-
+  val isLR     = Bool()
+  val isSC     = Bool()
+  val isAmo    = Bool()
+  val amoOp    = UInt(5.W)
+  val aq       = Bool()
+  val rl       = Bool()
   val useImm   = Bool()
   val isLoad   = Bool()
   val isStore  = Bool()
@@ -363,6 +402,7 @@ class IDEXReg extends Bundle {
   val isLui    = Bool()
   val isAuipc  = Bool()
   val isCsr    = Bool()
+  val isMulDiv = Bool()
   val valid    = Bool()
 }
 
@@ -373,6 +413,10 @@ class EXMEMReg extends Bundle {
   val memOp   = UInt(3.W)
   val isLoad  = Bool()
   val isStore = Bool()
+  val isLR    = Bool()
+  val isSC    = Bool()
+  val isAmo   = Bool()
+  val amoOp   = UInt(5.W)
   val valid   = Bool()
 }
 
