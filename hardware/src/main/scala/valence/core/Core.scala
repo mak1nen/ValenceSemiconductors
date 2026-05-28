@@ -101,11 +101,42 @@ class Core(p: CoreParams) extends Module {
   val csrSrcNonZero =
     csrSrc =/= 0.U
 
+  // ---------------------------------------------------------------------------
+  // Trap / interrupt resolution (EX stage)
+  //
+  // For this milestone traps resolve in EX, where id_ex.pc gives us mepc and
+  // the existing branch-redirect path can carry the vector to the frontend.
+  // Load/store/page-fault traps that are only known in MEM come later, when
+  // EX/MEM gains pc + exception fields alongside the MMU work.
+  // ---------------------------------------------------------------------------
+
+  // Synchronous exceptions visible in EX.
+  val excSync =
+    id_ex.io.out.valid &&
+    (id_ex.io.out.isEcall || id_ex.io.out.isEbreak || id_ex.io.out.illegal)
+
+  // Asynchronous interrupt: globally enabled, pending & enabled, and there is a
+  // real instruction in EX to pin mepc to. Sync exceptions take priority.
+  val globalIE   = csr.io.mstatus(CSRFile.MSTATUS_MIE_BIT)
+  val irqPending = (csr.io.mip & csr.io.mie) =/= 0.U
+  val takeIrq    = globalIE && irqPending && id_ex.io.out.valid && !excSync
+
+  val mretReq    = id_ex.io.out.valid && id_ex.io.out.isMret
+
+  // ---------------------------------------------------------------------------
+  // CSR software write enable
+  //
+  // Suppressed when this EX instruction is an interrupt victim — it will be
+  // re-executed after the handler returns, so its CSR side effect must not
+  // commit now.
+  // ---------------------------------------------------------------------------
+
   val csrWriteEnable =
     id_ex.io.out.valid &&
     id_ex.io.out.isCsr &&
     (csrIsWriteType ||
-    (csrIsSetClearType && csrSrcNonZero))
+    (csrIsSetClearType && csrSrcNonZero)) &&
+    !takeIrq
 
   val exStageResult = Mux(
     id_ex.io.out.isCsr,
@@ -142,12 +173,18 @@ class Core(p: CoreParams) extends Module {
 
   // ---------------------------------------------------------------------------
   // Frontend
+  //
+  // Single redirect driver: a trap redirect overrides a branch redirect.
   // ---------------------------------------------------------------------------
 
   frontend.io.stall        := pipe_stall
   frontend.io.flush        := hazard.io.flush
-  frontend.io.redirect     := execute.io.out.branch_taken
-  frontend.io.target       := execute.io.out.branch_target
+  frontend.io.redirect     := execute.io.out.branch_taken || trap.io.redirect
+  frontend.io.target       := Mux(
+                                trap.io.redirect,
+                                trap.io.redirectPc,
+                                execute.io.out.branch_target
+                              )
   frontend.io.instr        := io.icache_data
   frontend.io.icache_stall := io.icache_stall
 
@@ -159,7 +196,7 @@ class Core(p: CoreParams) extends Module {
   // ---------------------------------------------------------------------------
 
   if_id.io.stall    := pipe_stall
-  if_id.io.flush    := hazard.io.flush
+  if_id.io.flush    := hazard.io.flush || trap.io.redirect
 
   if_id.io.in.pc    := frontend.io.out_pc
   if_id.io.in.instr := frontend.io.out_instr
@@ -216,10 +253,13 @@ class Core(p: CoreParams) extends Module {
 
   // ---------------------------------------------------------------------------
   // ID/EX register
+  //
+  // Flush when a trap redirect fires, so the instruction(s) already in flight
+  // behind the trapping one are squashed (they belong to the wrong path).
   // ---------------------------------------------------------------------------
 
   id_ex.io.stall := mem_stall
-  id_ex.io.flush := hazard.io.stall || hazard.io.flush
+  id_ex.io.flush := hazard.io.stall || hazard.io.flush || trap.io.redirect
 
   id_ex.io.in.pc       := if_id.io.out.pc
   id_ex.io.in.rs1_val  := fwd_rs1
@@ -249,6 +289,14 @@ class Core(p: CoreParams) extends Module {
   id_ex.io.in.isAuipc  := decode.io.out.isAuipc
   id_ex.io.in.isCsr    := decode.io.out.isCsr
   id_ex.io.in.isMulDiv := decode.io.out.isMulDiv
+
+  // System / privileged instructions (require matching DecodeOut fields).
+  id_ex.io.in.isEcall  := decode.io.out.isEcall
+  id_ex.io.in.isEbreak := decode.io.out.isEbreak
+  id_ex.io.in.isMret   := decode.io.out.isMret
+  id_ex.io.in.isWfi    := decode.io.out.isWfi
+  id_ex.io.in.illegal  := decode.io.out.illegal
+
   id_ex.io.in.valid    := if_id.io.out.valid && !hazard.io.stall
 
   // ---------------------------------------------------------------------------
@@ -259,6 +307,9 @@ class Core(p: CoreParams) extends Module {
 
   // ---------------------------------------------------------------------------
   // EX/MEM register
+  //
+  // valid is suppressed for an interrupt victim so it does not commit a
+  // load/store/AMO that will be re-run after the handler.
   // ---------------------------------------------------------------------------
 
   ex_mem.io.stall := mem_stall
@@ -274,7 +325,7 @@ class Core(p: CoreParams) extends Module {
   ex_mem.io.in.isSC    := execute.io.out.isSC
   ex_mem.io.in.isAmo   := execute.io.out.isAmo
   ex_mem.io.in.amoOp   := execute.io.out.amoOp
-  ex_mem.io.in.valid   :=
+  ex_mem.io.in.valid   := (
     execute.io.out.valid   ||
     id_ex.io.out.isJal     ||
     id_ex.io.out.isJalr    ||
@@ -282,6 +333,7 @@ class Core(p: CoreParams) extends Module {
     id_ex.io.out.isLR      ||
     id_ex.io.out.isSC      ||
     id_ex.io.out.isAmo
+  ) && !takeIrq
 
   // ---------------------------------------------------------------------------
   // Memory
@@ -310,9 +362,12 @@ class Core(p: CoreParams) extends Module {
 
   // ---------------------------------------------------------------------------
   // MEM/WB register
+  //
+  // Must stall in lockstep with MEM, or a load held in MEM by dcache_stall
+  // latches into MEM/WB every cycle and writeback + retire fire repeatedly.
   // ---------------------------------------------------------------------------
 
-  mem_wb.io.stall     := false.B
+  mem_wb.io.stall     := mem_stall
   mem_wb.io.flush     := false.B
   mem_wb.io.in.result := memory.io.out.result
   mem_wb.io.in.rd     := memory.io.out.rd
@@ -329,32 +384,41 @@ class Core(p: CoreParams) extends Module {
   regfile.io.wdata := writeback.io.wdata
 
   // ---------------------------------------------------------------------------
-  // CSR + TrapUnit
+  // CSR file
   // ---------------------------------------------------------------------------
 
-  csr.io.wen   := csrWriteEnable
-  csr.io.wdata := csrWriteData
+  csr.io.wen    := csrWriteEnable
+  csr.io.wdata  := csrWriteData
   csr.io.retire := mem_wb.io.out.valid
 
-  csr.io.takeTrap  := false.B
-  csr.io.trapEpc   := 0.U(p.xlen.W)
-  csr.io.trapCause := 0.U(p.xlen.W)
-  csr.io.trapTval  := 0.U(p.xlen.W)
-  csr.io.takeMret  := false.B
+  // Trap entry / mret — driven by TrapUnit, not hardwired.
+  csr.io.takeTrap  := trap.io.takeTrap
+  csr.io.trapEpc   := trap.io.trapEpc
+  csr.io.trapCause := trap.io.trapCause
+  csr.io.trapTval  := trap.io.trapTval
+  csr.io.takeMret  := trap.io.takeMret
+
   csr.io.mtipIn    := io.timer_irq
   csr.io.msipIn    := io.soft_irq
   csr.io.meipIn    := false.B
 
-  trap.io.pc                       := 0.U(p.xlen.W)
+  // ---------------------------------------------------------------------------
+  // TrapUnit
+  //
+  // Inputs now carry the real EX-stage signals. Outputs (takeTrap / epc /
+  // cause / tval / takeMret / redirect / target) are consumed above.
+  // ---------------------------------------------------------------------------
+
+  trap.io.pc                       := id_ex.io.out.pc
   trap.io.instr                    := 0.U(32.W)
-  trap.io.illegalInstr             := false.B
-  trap.io.ecall                    := false.B
-  trap.io.ebreak                   := false.B
+  trap.io.illegalInstr             := id_ex.io.out.illegal && id_ex.io.out.valid
+  trap.io.ecall                    := id_ex.io.out.isEcall && id_ex.io.out.valid
+  trap.io.ebreak                   := id_ex.io.out.isEbreak && id_ex.io.out.valid
   trap.io.instrAddrMisaligned      := false.B
   trap.io.loadAddrMisaligned       := false.B
   trap.io.storeAddrMisaligned      := false.B
   trap.io.badAddr                  := 0.U(p.xlen.W)
-  trap.io.mret                     := false.B
+  trap.io.mret                     := mretReq
   trap.io.mtvec                    := csr.io.mtvec
   trap.io.mepc                     := csr.io.mepc
   trap.io.mstatus                  := csr.io.mstatus
@@ -362,6 +426,38 @@ class Core(p: CoreParams) extends Module {
   trap.io.machineSoftwareInterrupt := io.soft_irq
   trap.io.machineTimerInterrupt    := io.timer_irq
   trap.io.machineExternalInterrupt := false.B
+
+  // ---------------------------------------------------------------------------
+  // Temporary trap debug
+  // ---------------------------------------------------------------------------
+
+  when(excSync) {
+    printf(p"[TRAP-sync] ")
+    printf(p"pc=0x${Hexadecimal(id_ex.io.out.pc)} ")
+    printf(p"ecall=${id_ex.io.out.isEcall} ")
+    printf(p"ebreak=${id_ex.io.out.isEbreak} ")
+    printf(p"illegal=${id_ex.io.out.illegal}\n")
+  }
+
+  when(takeIrq) {
+    printf(p"[TRAP-irq] ")
+    printf(p"pc=0x${Hexadecimal(id_ex.io.out.pc)} ")
+    printf(p"mip=0x${Hexadecimal(csr.io.mip)} ")
+    printf(p"mie=0x${Hexadecimal(csr.io.mie)} ")
+    printf(p"mstatus=0x${Hexadecimal(csr.io.mstatus)}\n")
+  }
+
+  when(trap.io.takeTrap) {
+    printf(p"[TRAP-enter] ")
+    printf(p"cause=0x${Hexadecimal(trap.io.trapCause)} ")
+    printf(p"epc=0x${Hexadecimal(trap.io.trapEpc)} ")
+    printf(p"target=0x${Hexadecimal(trap.io.redirectPc)}\n")
+  }
+
+  when(trap.io.takeMret) {
+    printf(p"[MRET] ")
+    printf(p"mepc=0x${Hexadecimal(csr.io.mepc)}\n")
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -403,6 +499,14 @@ class IDEXReg extends Bundle {
   val isAuipc  = Bool()
   val isCsr    = Bool()
   val isMulDiv = Bool()
+
+  // System / privileged
+  val isEcall  = Bool()
+  val isEbreak = Bool()
+  val isMret   = Bool()
+  val isWfi    = Bool()
+  val illegal  = Bool()
+
   val valid    = Bool()
 }
 

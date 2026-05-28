@@ -61,6 +61,15 @@ class DecodeOut extends Bundle {
 
   val amoOp    = UInt(5.W)
 
+  // SYSTEM/privileged control instructions (ECALL, EBREAK, MRET, SRET, WFI, illegal trap handling)
+  val isSystem   = Bool()
+  val isEcall    = Bool()
+  val isEbreak   = Bool()
+  val isMret     = Bool()
+  val isSret     = Bool()   // for the S-mode step
+  val isWfi      = Bool()
+  val illegal    = Bool()   // optional now, needed for the illegal-instr trap
+
   // aq / rl bits
   val aq       = Bool()
   val rl       = Bool()
@@ -345,4 +354,17 @@ class Decode extends Module {
   // ───────────────────────────────────────────────────────────────────────────
 
   out.brOp := funct3
+
+  // SYSTEM opcode decode (ECALL/EBREAK/trap return/WFI privileged instructions)
+  val isSys000 = (opcode === Opcode.SYSTEM) && (funct3 === "b000".U)
+  val sysImm   = instr(31, 20)
+  out.isEcall  := isSys000 && (sysImm === "h000".U)
+  out.isEbreak := isSys000 && (sysImm === "h001".U)
+  out.isSret   := isSys000 && (sysImm === "h102".U)
+  out.isMret   := isSys000 && (sysImm === "h302".U)
+  out.isWfi    := isSys000 && (sysImm === "h105".U) // decode as NOP until interrupt support
+
+  out.isSystem := opcode === Opcode.SYSTEM
+  out.illegal  := false.B   // wire to real illegal-instr detection later
+
 }

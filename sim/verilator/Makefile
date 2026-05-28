@@ -37,11 +37,15 @@ sw: $(HEX)
 $(HEX): $(ELF)
 	$(OBJCOPY) -O verilog $< $@
 
-$(ELF): $(SW_DIR)/tests/$(TEST).c $(SW_DIR)/boot/start.S
+$(ELF): $(SW_DIR)/tests/$(TEST).c \
+        $(SW_DIR)/boot/start.S \
+        $(SW_DIR)/boot/mModeTrap.S
+
 	$(CC) $(CFLAGS) \
 	    -T $(SW_DIR)/linker.id \
 	    $(SW_DIR)/boot/start.S \
-	    $< \
+	    $(SW_DIR)/boot/mModeTrap.S \
+	    $(SW_DIR)/tests/$(TEST).c \
 	    -o $@
 
 # ── run ───────────────────────────────────────────────────────────────────────
