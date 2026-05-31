@@ -50,11 +50,11 @@ class Memory extends Module {
   val bitShift   = byteOffset << 3
 
   // ───────────────────────────────────────────────────────────────────────────
-  // Alignment checks for atomics
+  // Width / alignment checks
   // ───────────────────────────────────────────────────────────────────────────
 
-  val isWordAtomic  = io.in.memOp === "b010".U
-  val isDwordAtomic = io.in.memOp === "b011".U
+  val isWordOp  = io.in.memOp === "b010".U
+  val isDwordOp = io.in.memOp === "b011".U
 
   val isAtomic =
     io.in.isLR ||
@@ -64,8 +64,8 @@ class Memory extends Module {
   val misalignedAtomic =
     isAtomic &&
     (
-      (isWordAtomic  && io.in.result(1, 0) =/= 0.U) ||
-      (isDwordAtomic && io.in.result(2, 0) =/= 0.U)
+      (isWordOp  && io.in.result(1, 0) =/= 0.U) ||
+      (isDwordOp && io.in.result(2, 0) =/= 0.U)
     )
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -83,7 +83,7 @@ class Memory extends Module {
   // AMO/LR/SC.W use 4 bytes.
   // AMO/LR/SC.D use 8 bytes.
   val atomicMask = Mux(
-    io.in.memOp === "b011".U,
+    isDwordOp,
     "hff".U(8.W),
     ("h0f".U(8.W) << byteOffset)
   )
@@ -99,13 +99,13 @@ class Memory extends Module {
     io.dcache_rdata >> bitShift
 
   val loadResult = MuxLookup(io.in.memOp, io.dcache_rdata)(Seq(
-    "b000".U -> Cat(Fill(56, shiftedLoad(7)),  shiftedLoad(7,  0)),  // LB
-    "b001".U -> Cat(Fill(48, shiftedLoad(15)), shiftedLoad(15, 0)),  // LH
-    "b010".U -> Cat(Fill(32, shiftedLoad(31)), shiftedLoad(31, 0)),  // LW
-    "b011".U -> shiftedLoad,                                          // LD
-    "b100".U -> Cat(0.U(56.W), shiftedLoad(7,  0)),                  // LBU
-    "b101".U -> Cat(0.U(48.W), shiftedLoad(15, 0)),                  // LHU
-    "b110".U -> Cat(0.U(32.W), shiftedLoad(31, 0))                   // LWU
+    "b000".U -> Cat(Fill(56, shiftedLoad(7)),  shiftedLoad(7,  0)), // LB
+    "b001".U -> Cat(Fill(48, shiftedLoad(15)), shiftedLoad(15, 0)), // LH
+    "b010".U -> Cat(Fill(32, shiftedLoad(31)), shiftedLoad(31, 0)), // LW
+    "b011".U -> shiftedLoad,                                        // LD
+    "b100".U -> Cat(0.U(56.W), shiftedLoad(7,  0)),                 // LBU
+    "b101".U -> Cat(0.U(48.W), shiftedLoad(15, 0)),                 // LHU
+    "b110".U -> Cat(0.U(32.W), shiftedLoad(31, 0))                  // LWU
   ))
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -129,53 +129,83 @@ class Memory extends Module {
   //   10100 AMOMAX
   //   11000 AMOMINU
   //   11100 AMOMAXU
+  //
+  // Critical RISC-V rule:
+  //   AMO rd gets the OLD memory value.
+  //   Memory gets the NEW computed value.
+  //
+  // For .W AMOs on RV64:
+  //   rd = sign_extend(old_mem_word)
+  //   memory word = computed_new_word
+  //
+  // For .D AMOs:
+  //   rd = old_mem_dword
+  //   memory dword = computed_new_dword
+  // ───────────────────────────────────────────────────────────────────────────
 
-  val memVal = loadResult
-  val rs2    = io.in.rs2_val
+  val rs2 = io.in.rs2_val
 
-  val memValS = memVal.asSInt
-  val rs2S    = rs2.asSInt
+  // Dword AMO operates on the raw 64-bit memory beat.
+  // Dword atomics must be naturally aligned, so byteOffset should be zero.
+  val oldDword = io.dcache_rdata
+  val rs2Dword = rs2
 
-  val isWordOp =
-    io.in.memOp === "b010".U
+  val oldDwordS = oldDword.asSInt
+  val rs2DwordS = rs2Dword.asSInt
 
-  val memWord = loadResult(31, 0)
+  val amoAddD = (oldDword + rs2Dword)(63, 0)
+
+  val amoNewDword = MuxLookup(io.in.amoOp, oldDword)(Seq(
+    "b00001".U -> rs2Dword,                                      // AMOSWAP.D
+    "b00000".U -> amoAddD,                                       // AMOADD.D
+    "b00100".U -> (oldDword ^ rs2Dword),                         // AMOXOR.D
+    "b01100".U -> (oldDword & rs2Dword),                         // AMOAND.D
+    "b01000".U -> (oldDword | rs2Dword),                         // AMOOR.D
+    "b10000".U -> Mux(oldDwordS < rs2DwordS, oldDword, rs2Dword), // AMOMIN.D
+    "b10100".U -> Mux(oldDwordS > rs2DwordS, oldDword, rs2Dword), // AMOMAX.D
+    "b11000".U -> Mux(oldDword < rs2Dword, oldDword, rs2Dword),   // AMOMINU.D
+    "b11100".U -> Mux(oldDword > rs2Dword, oldDword, rs2Dword)    // AMOMAXU.D
+  ))
+
+  // Word AMO operates on the selected 32-bit word from the 64-bit beat.
+  // For addresses ending in ...0 use low word; for ...4 use high word.
+  val oldWord = shiftedLoad(31, 0)
   val rs2Word = rs2(31, 0)
 
-  val memWordS = memWord.asSInt
+  val oldWordS = oldWord.asSInt
   val rs2WordS = rs2Word.asSInt
 
-  // 64-bit AMO result
-  val amoResult64 = MuxLookup(io.in.amoOp, memVal)(Seq(
-    "b00001".U -> rs2,                                      // AMOSWAP
-    "b00000".U -> (memVal + rs2),                           // AMOADD
-    "b00100".U -> (memVal ^ rs2),                           // AMOXOR
-    "b01100".U -> (memVal & rs2),                           // AMOAND
-    "b01000".U -> (memVal | rs2),                           // AMOOR
-    "b10000".U -> Mux(memValS < rs2S, memVal, rs2).asUInt,  // AMOMIN
-    "b10100".U -> Mux(memValS > rs2S, memVal, rs2).asUInt,  // AMOMAX
-    "b11000".U -> Mux(memVal < rs2, memVal, rs2),           // AMOMINU
-    "b11100".U -> Mux(memVal > rs2, memVal, rs2)            // AMOMAXU
+  val amoAddW = (oldWord + rs2Word)(31, 0)
+
+  val amoNewWord = MuxLookup(io.in.amoOp, oldWord)(Seq(
+    "b00001".U -> rs2Word,                                    // AMOSWAP.W
+    "b00000".U -> amoAddW,                                    // AMOADD.W
+    "b00100".U -> (oldWord ^ rs2Word),                        // AMOXOR.W
+    "b01100".U -> (oldWord & rs2Word),                        // AMOAND.W
+    "b01000".U -> (oldWord | rs2Word),                        // AMOOR.W
+    "b10000".U -> Mux(oldWordS < rs2WordS, oldWord, rs2Word), // AMOMIN.W
+    "b10100".U -> Mux(oldWordS > rs2WordS, oldWord, rs2Word), // AMOMAX.W
+    "b11000".U -> Mux(oldWord < rs2Word, oldWord, rs2Word),   // AMOMINU.W
+    "b11100".U -> Mux(oldWord > rs2Word, oldWord, rs2Word)    // AMOMAXU.W
   ))
 
-  // 32-bit AMO result
-  val amoResult32 = MuxLookup(io.in.amoOp, memWord)(Seq(
-    "b00001".U -> rs2Word,                                          // AMOSWAP.W
-    "b00000".U -> (memWord + rs2Word),                              // AMOADD.W
-    "b00100".U -> (memWord ^ rs2Word),                              // AMOXOR.W
-    "b01100".U -> (memWord & rs2Word),                              // AMOAND.W
-    "b01000".U -> (memWord | rs2Word),                              // AMOOR.W
-    "b10000".U -> Mux(memWordS < rs2WordS, memWord, rs2Word).asUInt, // AMOMIN.W
-    "b10100".U -> Mux(memWordS > rs2WordS, memWord, rs2Word).asUInt, // AMOMAX.W
-    "b11000".U -> Mux(memWord < rs2Word, memWord, rs2Word),          // AMOMINU.W
-    "b11100".U -> Mux(memWord > rs2Word, memWord, rs2Word)           // AMOMAXU.W
-  ))
+  val amoReturnW =
+    Cat(Fill(32, oldWord(31)), oldWord)
 
-  val finalAmoResult = Mux(
-    isWordOp,
-    Cat(Fill(32, amoResult32(31)), amoResult32),
-    amoResult64
-  )
+  val amoReturnD =
+    oldDword
+
+  val amoReturnValue =
+    Mux(isWordOp, amoReturnW, amoReturnD)
+
+  val amoWriteDataW =
+    Cat(0.U(32.W), amoNewWord) << bitShift
+
+  val amoWriteDataD =
+    amoNewDword
+
+  val amoWriteData =
+    Mux(isWordOp, amoWriteDataW, amoWriteDataD)
 
   // ───────────────────────────────────────────────────────────────────────────
   // SC success condition
@@ -226,7 +256,7 @@ class Memory extends Module {
     io.in.isAmo
 
   val writeData = MuxCase(shiftedStoreData, Seq(
-    io.in.isAmo -> (finalAmoResult << bitShift),
+    io.in.isAmo -> amoWriteData,
     io.in.isSC  -> shiftedStoreData
   ))
 
@@ -252,22 +282,22 @@ class Memory extends Module {
       atomicValid
     )
 
-
   // ───────────────────────────────────────────────────────────────────────────
   // Result to writeback
   // ───────────────────────────────────────────────────────────────────────────
   //
   // LR    -> loaded value
   // SC    -> 0 on success, 1 on failure
-  // AMO   -> old memory value
+  // AMO   -> OLD memory value
   // Load  -> loaded value
   // Store -> address / ALU result
+  // ───────────────────────────────────────────────────────────────────────────
 
   io.out.result := MuxCase(io.in.result, Seq(
     io.in.isLoad -> loadResult,
     io.in.isLR   -> loadResult,
     io.in.isSC   -> Mux(scSuccess, 0.U(64.W), 1.U(64.W)),
-    io.in.isAmo  -> memVal
+    io.in.isAmo  -> amoReturnValue
   ))
 
   io.out.rd    := io.in.rd

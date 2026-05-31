@@ -152,7 +152,7 @@ class Core(p: CoreParams) extends Module {
   hazard.io.id_rs2 := decode.io.out.rs2
 
   hazard.io.ex_rd      := id_ex.io.out.rd
-  hazard.io.ex_is_load := id_ex.io.out.isLoad && id_ex.io.out.valid
+  hazard.io.ex_is_load := id_ex.io.out.valid && (id_ex.io.out.isLoad || id_ex.io.out.isLR || id_ex.io.out.isAmo)
 
   hazard.io.mem_rd      := ex_mem.io.out.rd
   hazard.io.mem_wen     := ex_mem.io.out.valid

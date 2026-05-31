@@ -25,7 +25,6 @@ object CSRFile {
   // mstatus bit positions (RV64)
   val MSTATUS_MIE_BIT  = 3
   val MSTATUS_MPIE_BIT = 7
-  // MPP is bits [12:11]; for now this core only runs M-mode, so MPP is forced to 11.
   val MSTATUS_MPP_LSB  = 11
 
   // mie / mip bit positions
@@ -63,19 +62,10 @@ class CSRFile(xlen: Int) extends Module {
     val rdata  = Output(UInt(xlen.W))
 
     // Retire pulse for minstret / instret.
-    // For now Core.scala can drive this with mem_wb.io.out.valid.
-    // Later, once precise traps are finished, drive it from real commitValid.
     val retire = Input(Bool())
 
     // ------------------------------------------------------------------------
     // Trap entry interface from TrapUnit.
-    //
-    // When takeTrap asserts:
-    //   mepc   := trapEpc
-    //   mcause := trapCause
-    //   mtval  := trapTval
-    //   mstatus.MPIE := mstatus.MIE
-    //   mstatus.MIE  := 0
     // ------------------------------------------------------------------------
     val takeTrap  = Input(Bool())
     val trapEpc   = Input(UInt(xlen.W))
@@ -83,10 +73,6 @@ class CSRFile(xlen: Int) extends Module {
     val trapTval  = Input(UInt(xlen.W))
 
     // MRET interface from TrapUnit.
-    //
-    // When takeMret asserts:
-    //   mstatus.MIE  := mstatus.MPIE
-    //   mstatus.MPIE := 1
     val takeMret = Input(Bool())
 
     // Hardware interrupt line inputs.
@@ -103,14 +89,36 @@ class CSRFile(xlen: Int) extends Module {
   })
 
   // --------------------------------------------------------------------------
+  // MISA value
+  //
+  // RV64 MXL = 2 in bits [63:62]
+  //
+  // Extension bits:
+  //   A = bit 0
+  //   I = bit 8
+  //   M = bit 12
+  //   S = bit 18
+  //   U = bit 20
+  //
+  // This advertises RV64IMASU.
+  // NOTE: This is enough to let OpenSBI take the S-mode-capable coldboot path.
+  // Full Linux boot will still require real S-mode behavior later.
+  // --------------------------------------------------------------------------
+
+  private val misaValue = (
+    (BigInt(2) << 62) | // RV64
+    (BigInt(1) << 0)  | // A
+    (BigInt(1) << 8)  | // I
+    (BigInt(1) << 12) | // M
+    (BigInt(1) << 18) | // S
+    (BigInt(1) << 20)   // U
+  ).U(xlen.W)
+
+  // --------------------------------------------------------------------------
   // CSR storage
   // --------------------------------------------------------------------------
 
   val mstatusReg = RegInit(0.U(xlen.W))
-
-  // TODO: later populate MISA with RV64 + supported extension bits.
-  // For now keep read-only zero.
-  val misa = RegInit(0.U(xlen.W))
 
   val mieReg   = RegInit(0.U(xlen.W))
   val mtvec    = RegInit(0.U(xlen.W))
@@ -121,12 +129,6 @@ class CSRFile(xlen: Int) extends Module {
 
   // --------------------------------------------------------------------------
   // Counter CSRs
-  //
-  // mcycle/cycle:
-  //   increments every clock
-  //
-  // minstret/instret:
-  //   increments when Core says one instruction retired
   // --------------------------------------------------------------------------
 
   val mcycle   = RegInit(0.U(xlen.W))
@@ -146,8 +148,6 @@ class CSRFile(xlen: Int) extends Module {
   // --------------------------------------------------------------------------
 
   val mip = Wire(UInt(xlen.W))
-  mip := 0.U
-
   mip := Cat(
     0.U((xlen - 12).W),
     io.meipIn,                // bit 11
@@ -179,7 +179,11 @@ class CSRFile(xlen: Int) extends Module {
       mppM
   }
 
-  // For now preserve user-provided mstatus bits but force MPP=M.
+  // Preserve user-provided mstatus bits but force MPP=M for now.
+  //
+  // TODO:
+  // Once real S-mode is implemented, do not force MPP=M.
+  // OpenSBI will eventually need to set MPP=S before mret into the payload.
   def normalizeMstatus(x: UInt): UInt = {
     val mppMask = (BigInt(3) << CSRFile.MSTATUS_MPP_LSB).U(xlen.W)
     val mppM    = (BigInt(3) << CSRFile.MSTATUS_MPP_LSB).U(xlen.W)
@@ -199,14 +203,14 @@ class CSRFile(xlen: Int) extends Module {
   val softwareCanWrite = io.wen && !io.takeTrap && !io.takeMret
 
   when (io.takeTrap) {
-    // Save MIE -> MPIE, clear MIE, force MPP = M.
+    // Save MIE -> MPIE, clear MIE, force MPP = M for now.
     mstatusReg := mstatusWithMieMpieMpp(
       mstatusReg,
       newMie  = false.B,
       newMpie = mstatusMie
     )
   } .elsewhen (io.takeMret) {
-    // Restore MIE from MPIE, set MPIE = 1, force MPP = M.
+    // Restore MIE from MPIE, set MPIE = 1, force MPP = M for now.
     mstatusReg := mstatusWithMieMpieMpp(
       mstatusReg,
       newMie  = mstatusMpie,
@@ -247,7 +251,7 @@ class CSRFile(xlen: Int) extends Module {
       is(CSRFile.MINSTRET.U) { minstret := io.wdata }
 
       // mstatus handled above.
-      // misa is read-only for now.
+      // misa is read-only.
       // mip is hardware driven for implemented interrupt pending bits.
       // mhartid is read-only.
       // cycle/instret are read-only aliases here.
@@ -260,7 +264,7 @@ class CSRFile(xlen: Int) extends Module {
 
   io.rdata := MuxLookup(io.addr, 0.U(xlen.W))(Seq(
     CSRFile.MSTATUS.U  -> mstatusReg,
-    CSRFile.MISA.U     -> misa,
+    CSRFile.MISA.U     -> misaValue,
     CSRFile.MIE.U      -> mieReg,
     CSRFile.MTVEC.U    -> mtvec,
     CSRFile.MSCRATCH.U -> mscratch,

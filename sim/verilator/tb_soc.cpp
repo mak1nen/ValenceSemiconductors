@@ -1,11 +1,7 @@
-// =============================================================================
-// tb_soc.cpp — Verilator testbench for Valence RISC-V SoC
-// =============================================================================
-
+// tb_soc.cpp — Verilator testbench for Valence RISC-V SoC (OpenSBI + DTB)
 #include "VSoC.h"
 #include "VSoC___024root.h"
 #include "verilated.h"
-
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,26 +10,21 @@
 #include <string>
 #include <vector>
 
-#define SRAM_BASE   0x20000000UL
-#define SRAM_WORDS  8192
-#define UART_BASE   0x10000000UL
+#define SRAM_BASE    0x20000000UL
+#define SRAM_WORDS   8192
+#define DRAM_BASE    0x80000000UL
+#define DRAM_WORDS   (256*1024*1024/8)  // 256MB
+#define UART_BASE    0x10000000UL
+#define UART_SIZE    0x1000UL
+#define DTB_ADDR     0x87000000UL
 
 struct UartDecoder {
-    int     baud_cycles;
-    int     state;        // 0=idle, 1=start, 2=data, 3=stop
-    int     bit_count;
-    int     sample_count;
+    int baud_cycles, state, bit_count, sample_count, prev_tx;
     uint8_t shift;
-    int     prev_tx;
 
-    UartDecoder(int clk_hz, int baud) {
-        baud_cycles  = clk_hz / baud;
-        state        = 0;
-        bit_count    = 0;
-        sample_count = 0;
-        shift        = 0;
-        prev_tx      = 1;
-    }
+    UartDecoder(int clk_hz, int baud)
+        : baud_cycles(clk_hz / baud), state(0), bit_count(0),
+          sample_count(0), prev_tx(1), shift(0) {}
 
     int tick(int tx) {
         int result = -1;
@@ -41,16 +32,16 @@ struct UartDecoder {
         switch (state) {
         case 0:
             if (prev_tx == 1 && tx == 0) {
-                state        = 1;
+                state = 1;
                 sample_count = baud_cycles / 2;
             }
             break;
 
         case 1:
             if (--sample_count <= 0) {
-                state        = 2;
-                bit_count    = 0;
-                shift        = 0;
+                state = 2;
+                bit_count = 0;
+                shift = 0;
                 sample_count = baud_cycles;
             }
             break;
@@ -58,19 +49,17 @@ struct UartDecoder {
         case 2:
             if (--sample_count <= 0) {
                 shift |= (tx & 1) << bit_count;
-                bit_count++;
-                sample_count = baud_cycles;
-
-                if (bit_count == 8) {
+                if (++bit_count == 8) {
                     state = 3;
                 }
+                sample_count = baud_cycles;
             }
             break;
 
         case 3:
             if (--sample_count <= 0) {
                 result = (int)(unsigned char)shift;
-                state  = 0;
+                state = 0;
             }
             break;
         }
@@ -80,32 +69,40 @@ struct UartDecoder {
     }
 };
 
-static void load_hex(const char* path, uint64_t* sram, size_t words) {
+static void load_hex(const char* path,
+                     uint64_t* sram,
+                     size_t sw,
+                     uint64_t* dram,
+                     size_t dw) {
     std::ifstream f(path);
     if (!f) {
-        fprintf(stderr, "[sim] Error: cannot open hex file: %s\n", path);
+        fprintf(stderr, "[sim] cannot open: %s\n", path);
         exit(1);
     }
 
     uint64_t addr = 0;
-    std::string line;
     size_t total = 0;
+    std::string line;
     std::vector<uint8_t> bytes;
 
-    auto flush_bytes = [&]() {
+    auto flush = [&]() {
         for (size_t i = 0; i < bytes.size(); i++) {
-            uint64_t byte_addr = addr + i;
+            uint64_t ba = addr + i;
 
-            if (byte_addr < SRAM_BASE) {
-                continue;
-            }
+            if (ba >= SRAM_BASE && ba < SRAM_BASE + sw * 8) {
+                uint64_t wi = (ba - SRAM_BASE) / 8;
+                uint64_t bo = (ba - SRAM_BASE) % 8;
 
-            uint64_t word_idx = (byte_addr - SRAM_BASE) / 8;
-            uint64_t byte_off = (byte_addr - SRAM_BASE) % 8;
+                sram[wi] &= ~(0xFFULL << (bo * 8));
+                sram[wi] |= ((uint64_t)bytes[i] << (bo * 8));
+                total++;
 
-            if (word_idx < words) {
-                sram[word_idx] &= ~(0xFFULL << (byte_off * 8));
-                sram[word_idx] |=  ((uint64_t)bytes[i] << (byte_off * 8));
+            } else if (ba >= DRAM_BASE && ba < DRAM_BASE + dw * 8) {
+                uint64_t wi = (ba - DRAM_BASE) / 8;
+                uint64_t bo = (ba - DRAM_BASE) % 8;
+
+                dram[wi] &= ~(0xFFULL << (bo * 8));
+                dram[wi] |= ((uint64_t)bytes[i] << (bo * 8));
                 total++;
             }
         }
@@ -119,63 +116,107 @@ static void load_hex(const char* path, uint64_t* sram, size_t words) {
         }
 
         if (line[0] == '@') {
-            flush_bytes();
+            flush();
             addr = std::stoull(line.substr(1), nullptr, 16);
         } else {
             std::istringstream ss(line);
-            std::string token;
+            std::string t;
 
-            while (ss >> token) {
-                bytes.push_back((uint8_t)std::stoul(token, nullptr, 16));
+            while (ss >> t) {
+                bytes.push_back((uint8_t)std::stoul(t, nullptr, 16));
             }
         }
     }
 
-    flush_bytes();
+    flush();
 
     printf("[sim] Loaded %zu bytes from %s\n", total, path);
+}
+
+static void load_blob(const char* path,
+                      uint64_t* dram,
+                      size_t dw,
+                      uint64_t phys) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        fprintf(stderr, "[sim] cannot open blob: %s\n", path);
+        exit(1);
+    }
+
+    std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)),
+                              std::istreambuf_iterator<char>());
+
+    for (size_t i = 0; i < data.size(); i++) {
+        uint64_t ba = phys + i;
+
+        if (ba >= DRAM_BASE && ba < DRAM_BASE + dw * 8) {
+            uint64_t wi = (ba - DRAM_BASE) / 8;
+            uint64_t bo = (ba - DRAM_BASE) % 8;
+
+            dram[wi] &= ~(0xFFULL << (bo * 8));
+            dram[wi] |= ((uint64_t)data[i] << (bo * 8));
+        }
+    }
+
+    printf("[sim] Loaded %zu byte blob from %s at 0x%llx\n",
+           data.size(), path, (unsigned long long)phys);
 }
 
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
 
-    const char* hex_image  = nullptr;
-    uint64_t    max_cycles = 10000000;
+    const char* hex = nullptr;
+    const char* dtb = nullptr;
+    uint64_t max_cycles = 50000000;
+    bool dbg = false;
 
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "+hex=", 5) == 0) {
-            hex_image = argv[i] + 5;
+            hex = argv[i] + 5;
+        }
+
+        if (strncmp(argv[i], "+dtb=", 5) == 0) {
+            dtb = argv[i] + 5;
         }
 
         if (strncmp(argv[i], "+cycles=", 8) == 0) {
             max_cycles = atoll(argv[i] + 8);
         }
+
+        if (strcmp(argv[i], "+dram_debug") == 0) {
+            dbg = true;
+        }
     }
+
+    static uint64_t dram_mem[DRAM_WORDS];
+    memset(dram_mem, 0, sizeof(dram_mem));
 
     VSoC* dut = new VSoC;
 
-    if (hex_image) {
-        auto& mem = dut->rootp->SoC__DOT__sram__DOT__mem_ext__DOT__Memory;
-        auto& fetch_mem = dut->rootp->SoC__DOT__sram__DOT__fetch_mem_ext__DOT__Memory;
+    if (hex) {
+        auto& mem  = dut->rootp->SoC__DOT__sram__DOT__mem_ext__DOT__Memory;
+        auto& fmem = dut->rootp->SoC__DOT__sram__DOT__fetch_mem_ext__DOT__Memory;
 
         for (size_t i = 0; i < SRAM_WORDS; i++) {
             mem[i] = 0;
-            fetch_mem[i] = 0;
+            fmem[i] = 0;
         }
 
-        load_hex(hex_image, (uint64_t*)&mem[0], SRAM_WORDS);
-        load_hex(hex_image, (uint64_t*)&fetch_mem[0], SRAM_WORDS);
+        load_hex(hex, (uint64_t*)&mem[0], SRAM_WORDS, dram_mem, DRAM_WORDS);
 
-        printf("[sim] SRAM data[0]  = 0x%016llx\n",
-               (unsigned long long)mem[0]);
-        printf("[sim] SRAM fetch[0] = 0x%016llx\n",
-               (unsigned long long)fetch_mem[0]);
+        for (size_t i = 0; i < SRAM_WORDS; i++) {
+            fmem[i] = mem[i];
+        }
     }
 
-    // Reset
-    dut->reset      = 1;
-    dut->clock      = 0;
+    if (dtb) {
+        load_blob(dtb, dram_mem, DRAM_WORDS, DTB_ADDR);
+    }
+
+    dut->reset = 1;
+    dut->clock = 0;
     dut->io_uart_rx = 1;
+    dut->io_dram_rdata = 0;
 
     for (int i = 0; i < 10; i++) {
         dut->clock = 0;
@@ -187,7 +228,6 @@ int main(int argc, char** argv) {
 
     dut->reset = 0;
 
-    // Must match UART(50000000, 115200) in SoC.scala.
     UartDecoder uart(50000000, 115200);
 
     uint64_t cycle = 0;
@@ -196,131 +236,115 @@ int main(int argc, char** argv) {
         dut->clock = 0;
         dut->eval();
 
+        // --------------------------------------------------------------------
+        // Two-phase DRAM/MMIO model.
+        //
+        // Important for AMOs:
+        //   1. Core presents addr.
+        //   2. Testbench drives io_dram_rdata from dram_mem/MMIO.
+        //   3. dut->eval() lets AMO write data settle from that rdata.
+        //   4. Testbench commits final write signals into dram_mem/MMIO.
+        //
+        // UART MMIO fallback is kept here, but normal UART accesses are now
+        // handled inside SoC.scala. This block is harmless if not used.
+        // --------------------------------------------------------------------
+        {
+            uint64_t addr = dut->io_dram_addr;
+
+            // Phase 1: drive read data.
+            if (addr >= UART_BASE && addr < UART_BASE + UART_SIZE) {
+                uint64_t off = addr - UART_BASE;
+
+                if ((off & 7ULL) == 5) {
+                    // 16550 LSR: bit 5 THRE + bit 6 TEMT.
+                    // Put 0x60 in every byte lane for robustness.
+                    dut->io_dram_rdata = 0x6060606060606060ULL;
+                } else {
+                    dut->io_dram_rdata = 0;
+                }
+
+            } else if (addr >= DRAM_BASE &&
+                       addr < DRAM_BASE + (uint64_t)DRAM_WORDS * 8) {
+                uint64_t wi = (addr - DRAM_BASE) / 8;
+                dut->io_dram_rdata = dram_mem[wi];
+
+            } else {
+                dut->io_dram_rdata = 0;
+            }
+
+            // Let combinational logic settle after rdata is provided.
+            // This is critical for AMO write data.
+            dut->eval();
+
+            // Phase 2: commit writes using settled signals.
+            addr = dut->io_dram_addr;
+
+            if (addr >= UART_BASE && addr < UART_BASE + UART_SIZE) {
+                uint64_t off = addr - UART_BASE;
+
+                if (dut->io_dram_valid && dut->io_dram_wen && ((off & 7ULL) == 0)) {
+                    uint64_t lane_shift = (addr & 7ULL) * 8ULL;
+                    char ch = (char)((dut->io_dram_wdata >> lane_shift) & 0xff);
+
+                    putchar(ch);
+                    fflush(stdout);
+                }
+
+            } else if (addr >= DRAM_BASE &&
+                       addr < DRAM_BASE + (uint64_t)DRAM_WORDS * 8) {
+                uint64_t wi = (addr - DRAM_BASE) / 8;
+                uint64_t old = dram_mem[wi];
+
+                if (dut->io_dram_valid && dut->io_dram_wen) {
+                    uint8_t strb = dut->io_dram_wstrb;
+                    uint64_t val = dut->io_dram_wdata;
+                    uint64_t msk = 0;
+
+                    for (int b = 0; b < 8; b++) {
+                        if (strb & (1 << b)) {
+                            msk |= 0xFFULL << (b * 8);
+                        }
+                    }
+
+                    uint64_t next = (old & ~msk) | (val & msk);
+                    dram_mem[wi] = next;
+
+                    if (dbg) {
+                        printf("[DRAM-W] cy=%llu addr=0x%09llx old=0x%016llx new=0x%016llx strb=0x%02x\n",
+                               (unsigned long long)cycle,
+                               (unsigned long long)addr,
+                               (unsigned long long)old,
+                               (unsigned long long)dram_mem[wi],
+                               (unsigned)strb);
+                    }
+                }
+            }
+        }
+
         dut->clock = 1;
         dut->eval();
 
-        bool tx_valid = dut->rootp->SoC__DOT____Vcellinp__uart__io_tx_valid;
-        uint8_t tx_data = dut->rootp->SoC__DOT__uart__DOT__shift_reg;
-        uint8_t uart_state = dut->rootp->SoC__DOT__uart__DOT__state;
-
-        if (tx_valid && uart_state == 0) {
-            uint64_t a0 = dut->rootp->SoC__DOT__core__DOT__regfile__DOT__regs_10;
-            uint64_t a4 = dut->rootp->SoC__DOT__core__DOT__regfile__DOT__regs_14;
-            uint64_t a5 = dut->rootp->SoC__DOT__core__DOT__regfile__DOT__regs_15;
-
-            printf("[uart-accept] cycle=%llu tx=0x%02x \'%c\' a0=0x%016llx a4=0x%016llx a5=0x%016llx\n",
-                   (unsigned long long)cycle,
-                   tx_data,
-                   (tx_data >= 32 && tx_data <= 126) ? tx_data : '.',
-                   (unsigned long long)a0,
-                   (unsigned long long)a4,
-                   (unsigned long long)a5);
-        }
-
-        // Atomic debug
-        {
-            bool idex_isLR  = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_isLR;
-            bool idex_isSC  = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_isSC;
-            bool exmem_isLR = dut->rootp->SoC__DOT__core__DOT__ex_mem__DOT__reg_isLR;
-            bool exmem_isSC = dut->rootp->SoC__DOT__core__DOT__ex_mem__DOT__reg_isSC;
-
-            if (idex_isLR || idex_isSC || exmem_isLR || exmem_isSC) {
-                bool resv         = dut->rootp->SoC__DOT__core__DOT__memory__DOT__reservationValid;
-                uint64_t res_addr = dut->rootp->SoC__DOT__core__DOT__memory__DOT__reservationAddr;
-                uint64_t ex_addr  = dut->rootp->SoC__DOT__core__DOT__ex_mem__DOT__reg_result;
-                uint64_t ex_rs2   = dut->rootp->SoC__DOT__core__DOT__ex_mem__DOT__reg_rs2_val;
-                bool dcache_wen   = dut->rootp->SoC__DOT___core_io_dcache_wen;
-
-                printf("[ATOMIC] cycle=%llu idexLR=%d idexSC=%d exmemLR=%d exmemSC=%d resv=%d res_addr=0x%016llx ex_addr=0x%016llx rs2=0x%016llx dwen=%d\n",
-                       (unsigned long long)cycle,
-                       idex_isLR,
-                       idex_isSC,
-                       exmem_isLR,
-                       exmem_isSC,
-                       resv,
-                       (unsigned long long)res_addr,
-                       (unsigned long long)ex_addr,
-                       (unsigned long long)ex_rs2,
-                       dcache_wen);
-            }
-
-            // When LR or SC is in ID/EX, dump its decoded inputs.
-            // This is where we catch a bad immediate, wrong rs1, or wrong amoOp.
-            if (idex_isLR || idex_isSC) {
-                uint64_t idex_pc      = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_pc;
-                uint64_t idex_rs1_val = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_rs1_val;
-                uint64_t idex_rs2_val = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_rs2_val;
-                uint64_t idex_imm     = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_imm;
-                uint8_t  idex_aluOp   = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_aluOp;
-                uint8_t  idex_amoOp   = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_amoOp;
-                bool     idex_useImm  = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_useImm;
-                uint8_t  idex_rd      = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_rd;
-
-                printf("[%s-idex] cycle=%llu pc=0x%08llx rd=x%u rs1=0x%016llx rs2=0x%016llx imm=0x%016llx useImm=%d aluOp=%u amoOp=%u\n",
-                       idex_isLR ? "LR" : "SC",
-                       (unsigned long long)cycle,
-                       (unsigned long long)idex_pc,
-                       idex_rd,
-                       (unsigned long long)idex_rs1_val,
-                       (unsigned long long)idex_rs2_val,
-                       (unsigned long long)idex_imm,
-                       idex_useImm,
-                       idex_aluOp,
-                       idex_amoOp);
-            }
-        }
-
-        // UART decode + DONE detection
         int ch = uart.tick(dut->io_uart_tx);
         if (ch >= 0) {
             putchar(ch);
             fflush(stdout);
 
-            static char buf[8] = {};
-            memmove(buf, buf + 1, 3);
-            buf[3] = (char)ch;
+            static char buf[16] = {};
+            memmove(buf, buf + 1, 7);
+            buf[7] = (char)ch;
 
-            if (strncmp(buf, "DONE", 4) == 0) {
-                printf("\n[sim] DONE received — stopping\n");
+            if (strncmp(buf + 4, "DONE", 4) == 0) {
+                printf("\n[sim] DONE at cycle %llu\n", (unsigned long long)cycle);
                 break;
             }
-        }
-
-        if (cycle < 120) {
-            uint64_t idex_pc  = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_pc;
-            uint8_t  idex_rd  = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_rd;
-            bool     idex_jal = dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_isJal;
-            bool     idex_jalr= dut->rootp->SoC__DOT__core__DOT__id_ex__DOT__reg_isJalr;
-            uint64_t ex_res   = dut->rootp->SoC__DOT__core__DOT___memory_io_out_result;
-            uint64_t x1       = dut->rootp->SoC__DOT__core__DOT__regfile__DOT__regs_1;
-
-            if (idex_jal || idex_jalr || idex_rd == 1 || x1 == 9) {
-                printf("[ra-debug] cycle=%llu idex_pc=0x%08llx rd=x%u jal=%d jalr=%d ex_res=0x%016llx x1=0x%016llx\n",
-                    (unsigned long long)cycle,
-                    (unsigned long long)idex_pc,
-                    idex_rd,
-                    idex_jal,
-                    idex_jalr,
-                    (unsigned long long)ex_res,
-                    (unsigned long long)x1);
-            }
-
-            printf(
-                "[sim] cycle %llu  frontend_pc=0x%08llx  if_id_pc=0x%08llx  if_id_instr=0x%08x  x1=0x%016llx  x5=0x%016llx  x6=0x%016llx\n",
-                (unsigned long long)cycle,
-                (unsigned long long)dut->rootp->SoC__DOT__core__DOT__frontend__DOT__pc,
-                (unsigned long long)dut->rootp->SoC__DOT__core__DOT__if_id__DOT__reg_pc,
-                (uint32_t)dut->rootp->SoC__DOT__core__DOT__if_id__DOT__reg_instr,
-                (unsigned long long)dut->rootp->SoC__DOT__core__DOT__regfile__DOT__regs_1,
-                (unsigned long long)dut->rootp->SoC__DOT__core__DOT__regfile__DOT__regs_5,
-                (unsigned long long)dut->rootp->SoC__DOT__core__DOT__regfile__DOT__regs_6
-            );
         }
 
         cycle++;
     }
 
-    printf("[sim] completed %llu cycles\n", (unsigned long long)cycle);
+    if (cycle >= max_cycles) {
+        printf("\n[sim] cycle limit %llu reached\n", (unsigned long long)max_cycles);
+    }
 
     dut->final();
     delete dut;
